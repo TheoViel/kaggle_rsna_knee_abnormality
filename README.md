@@ -276,7 +276,7 @@ T4 times are extrapolated: isolated H100 fp16 latencies × 10, the rough fp16 ga
 | ROI U-Net | 1 GPU: ~6.6 min | 2 GPUs: ~3.3 min |
 | Box extraction (CPU) | 0.074 s/series, serial: 6.7 min | 0.008 s/series (exact, label within the region's bbox): 0.4 min |
 | Crop models | 1 GPU, every ROI: ~15 min | 2 GPUs, used findings only: ~6 min |
-| **Total** | **~40–50 min** | **~12–16 min**: max(disk, ~10 min GPU per T4) + ~1 min of model loading and cudnn warm-up |
+| **Total** | **~40–50 min** | **~12–16 min**: max(disk, ~10 min GPU per T4) + model loading and warm-up (seconds; `cudnn.benchmark` is off, it cost ~2 min of first-call autotuning on a T4) |
 
 Measured here with 4 cores and 2 H100s: 300 training studies in 139 s. That run was bound by cold NFS reads at ~300 MB/s; its GPU stages took 35 s per shard.
 

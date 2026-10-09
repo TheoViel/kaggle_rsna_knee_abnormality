@@ -281,7 +281,35 @@ Predictions for the 58 studies. How they were produced is not documented here.
 - **All 12 findings,** with b1_c1 on the 4 findings without an ROI: round 2 + b1_c1 scores **0.944**, vs 0.936 for b1_c1 alone.
 - **Noise:** the gains are within the ~±0.01–0.02 noise of 58 studies, but their direction is consistent across both rounds and most findings.
 
-### Next steps
+## 8. Through-plane frame sampling
+
+All runs use run 59's configuration: `all` group, ConvNeXt-tiny 128 px, sagittal + coronal, PL round-2 labels, seed 0, 10 epochs. Only the slices that make up the crop change (`crops.prepare --depth --z_mode --stride`):
+
+- **uniform** (used so far): n frames spread evenly over the box's slices widened by one slice each side, nearest slice. The median box spans ~9 slices including that margin, so 12 frames repeat slices.
+- **strided**: n real slices, `stride` apart, centred on the box centre, whatever the box's extent.
+- **resize**: the uniform positions, interpolated linearly between slices.
+
+Mean AUC over the 8 ROI findings on the 58 radiologist studies. ★ marks the holdout pick.
+
+| Run | Sampling | Frames | Stride | ACL | MCL | Medial Meniscus | Lateral Meniscus | Medial OA | Lateral OA | PF OA | Baker's | Mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `59` (reference) | uniform | 12 | – | 0.971 | 0.977 | 0.978 | 0.925 | 0.967 | 0.818 | 0.874 | 0.987 | 0.937 |
+| `70` (reference, seed 1) | uniform | 12 | – | 0.968 | 0.977 | 0.962 | 0.906 | **0.971** | 0.851 | 0.860 | 0.989 | 0.935 |
+| `71` | uniform | 8 | – | 0.973 | 0.984 | **0.990** | 0.914 | 0.969 | 0.816 | 0.870 | 0.989 | 0.938 |
+| `74` | uniform | 16 | – | 0.972 | 0.975 | 0.975 | 0.922 | 0.967 | 0.839 | 0.875 | 0.991 | 0.940 |
+| `75` | strided | 8 | 1 | 0.973 | 0.984 | 0.976 | 0.935 | 0.969 | **0.859** | 0.880 | **0.993** | **0.946** |
+| `72` ★ | strided | 12 | 1 | 0.971 | 0.984 | 0.977 | 0.908 | 0.969 | **0.859** | 0.883 | 0.984 | 0.942 |
+| `77` | strided | 16 | 1 | 0.972 | **1.000** | 0.972 | 0.918 | 0.966 | 0.816 | 0.888 | 0.984 | 0.940 |
+| `76` | strided | 8 | 2 | **0.974** | 0.973 | 0.976 | 0.884 | 0.961 | 0.803 | **0.892** | 0.967 | 0.929 |
+| `73` | resize | 12 | – | 0.971 | 0.973 | 0.971 | **0.944** | 0.967 | 0.836 | 0.874 | 0.989 | 0.941 |
+| `78` | resize | 16 | – | 0.971 | 0.991 | 0.966 | 0.940 | 0.967 | 0.845 | 0.878 | 0.991 | 0.944 |
+
+- **Noise:** the two seeds of the reference differ by 0.002 on the mean. Single findings (Lateral OA, Lateral Meniscus) move by up to 0.03 between seeds.
+- **Stride 1, 8–12 frames is best:** 0.946 and 0.942, against 0.935–0.937 for the reference. The holdout prefers 12 frames, 8 frames is level with the reference there. Spending the frames on adjacent real slices helps more than covering the box exactly.
+- **Stride 2 is the only clear loss** (0.929): 8 frames spread over ~16 slices take in too much outside the ROI.
+- **Frame count matters less than sampling.** Uniform 8 and 16 frames and resize 12 sit within noise of the reference. Resize 16 is up on the 58 (0.944) but level on the holdout.
+
+## Next steps
 
 - ROIs and crop models for the 4 remaining findings: capsule / joint recesses for effusion and synovitis, bone for contusion and fracture.
 - Combine the best variants found here per finding (224 px; axial for PF OA, ACL and MCL), trained on the round-2 targets. Then ensemble seeds and backbones of the ROI models.

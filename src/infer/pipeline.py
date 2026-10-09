@@ -18,7 +18,8 @@ reorganised for a small machine (Kaggle: 2 x T4, 4 CPU cores):
     stay on the GPU until its crops are cut. Box consensus, registration fill and
     axial boxes work within a knee, so chunking changes nothing;
   - each crop model only predicts the findings the recipe takes from it;
-  - float16 autocast, fixed batch shapes (zero padded) with cudnn.benchmark.
+  - float16 autocast, fixed batch shapes (zero padded); crop sampling (frames, stride)
+    read from each crop model's args.json, crops cut once per distinct sampling.
 The shards' per-model study probabilities are then gathered and combined per the
 recipe (rank average over all test studies) into the submission; findings the
 recipe does not cover stay at 0.5.
@@ -187,21 +188,29 @@ def _lr_axis(plane):
     return 0 if plane == "Sagittal" else 2          # of a (D, S, S) volume
 
 
-def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal):
-    """`crops.prepare.crop_box` of every ROI with a box -> (K, 12, 128, 128) uint8, have (K,)."""
-    from crops.prepare import DEPTH, SIZE, crop_window
+def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal, depth=12, z_mode="uniform", stride=1):
+    """`crops.prepare.crop_box` of every ROI with a box -> (K, depth, 128, 128) uint8, have (K,)."""
+    from crops.prepare import SIZE, crop_window
 
     n_c, cs = cache.shape[0], cache.shape[1]
-    out = torch.zeros((len(ROI_CLASSES), DEPTH, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
+    out = torch.zeros((len(ROI_CLASSES), depth, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
     have = np.zeros(len(ROI_CLASSES), bool)
     for k, c in enumerate(ROI_CLASSES):
         if c not in boxes:
             continue
-        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols)
-        win = torch.zeros((DEPTH, n, n), dtype=torch.float32, device=cache.device)
+        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols, depth, z_mode=z_mode, stride=stride)
+        win = torch.zeros((depth, n, n), dtype=torch.float32, device=cache.device)
         ys, xs, ye, xe = max(y0, 0), max(x0, 0), min(y0 + n, cs), min(x0 + n, cs)
         if ye > ys and xe > xs:
-            win[:, ys - y0:ye - y0, xs - x0:xe - x0] = cache[torch.as_tensor(zs, device=cache.device)][:, ys:ye, xs:xe]
+            if zs.dtype.kind == "f":          # resize: linear between the two nearest slices
+                lo = np.floor(zs).astype(int)
+                hi = np.minimum(lo + 1, n_c - 1)
+                w = torch.as_tensor(zs - lo, dtype=torch.float32, device=cache.device)[:, None, None]
+                sub = (1 - w) * cache[torch.as_tensor(lo, device=cache.device)][:, ys:ye, xs:xe].float() + \
+                    w * cache[torch.as_tensor(hi, device=cache.device)][:, ys:ye, xs:xe].float()
+            else:
+                sub = cache[torch.as_tensor(zs, device=cache.device)][:, ys:ye, xs:xe]
+            win[:, ys - y0:ye - y0, xs - x0:xe - x0] = sub
         t = F.interpolate(win[:, None], size=(SIZE, SIZE), mode="bilinear", antialias=True, align_corners=False)[:, 0]
         t = t.round().clamp(0, 255).to(torch.uint8)
         if flip:
@@ -214,7 +223,7 @@ def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal):
 
 
 def _padded(x, n):
-    """Zero-pad the batch dimension to n (fixed shapes for cudnn.benchmark)."""
+    """Zero-pad the batch dimension to n (one shape per model: no re-planning per batch size)."""
     return x if len(x) == n else torch.cat([x, x.new_zeros((n - len(x),) + x.shape[1:])])
 
 
@@ -249,8 +258,24 @@ class Models:
             net.load_state_dict(sd)
             net = net.to(device).eval().to(memory_format=torch.channels_last)
             used = [c for c in group if m in recipe.get(c, [])]     # findings the recipe takes from it
-            self.crops.append(dict(name=m, net=net, planes=a["planes"].split(","), planes_all=PLANES,
+            z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
+            self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
+                                   planes_all=PLANES,
                                    rois={c: (ROI_CLASSES.index(c), group.index(c)) for c in used}))
+
+
+    @torch.no_grad()
+    def warmup(self):
+        """One dummy batch through every network: CUDA / cuDNN first-call costs, out of the timings."""
+        amp = dict(device_type="cuda", dtype=torch.float16)
+        z = torch.zeros
+        with torch.autocast(**amp):
+            self.side(z((SIDE_BATCH, 4, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
+            self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
+            for m in self.crops:
+                i = z(CROP_BATCH, dtype=torch.long, device=self.device)
+                m["net"](z((CROP_BATCH, json.loads(m["z"])["depth"], 128, 128), device=self.device), i, i)
+        torch.cuda.synchronize()
 
 
 @torch.no_grad()
@@ -323,35 +348,38 @@ def process_chunk(studies, models, timer):
     for r in boxes.to_dict("records"):
         by_series.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in
                                                                         ["z0", "z1", "y0", "y1", "x0", "x1"]}
-    cs, crop_rows, have = [], [], []
-    for s in ser:
-        if s["SeriesInstanceUID"] not in by_series:
-            continue
-        c, h = gpu_crops(s["cache"], by_series[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
-                         (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal")
-        cs.append(c)
-        have.append(h)
-        crop_rows.append(s)
+    crop_rows = [s for s in ser if s["SeriesInstanceUID"] in by_series]
+    crops = {}                            # sampling -> (crops (N, K, D, S, S), have (N, K))
+    for z in {m["z"] for m in models.crops}:
+        cs, have = [], []
+        for s in crop_rows:
+            c, h = gpu_crops(s["cache"], by_series[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
+                             (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", **json.loads(z))
+            cs.append(c)
+            have.append(h)
+        if cs:
+            crops[z] = torch.stack(cs), np.stack(have)
+    torch.cuda.synchronize()
     timer["crops"] += time.time() - t
 
     # Crop models: every (series, ROI) of the planes and findings each one is used for.
-    t = time.time()
     out = []
-    if cs:
-        crops = torch.stack(cs)
-        have = np.stack(have)
-        for m in models.crops:
-            items = [(j, roi, rid, m["planes_all"].index(s["plane"]), s["StudyInstanceUID"], c)
-                     for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
-                     for c, (roi, rid) in m["rois"].items() if have[j, roi]]
-            for i in range(0, len(items), CROP_BATCH):
-                part = items[i:i + CROP_BATCH]
-                j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
-                x = _padded(crops[j, roi], CROP_BATCH).float() / 255
-                with torch.autocast(**amp):
-                    p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH)).float())
-                out += [(m["name"], st, c, float(v)) for (_, _, _, _, st, c), v in zip(part, p[:len(part)].tolist())]
-    timer["models"] += time.time() - t
+    for m in models.crops if crop_rows else []:
+        t = time.time()
+        x_all, have = crops[m["z"]]
+        items = [(j, roi, rid, m["planes_all"].index(s["plane"]), s["StudyInstanceUID"], c)
+                 for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
+                 for c, (roi, rid) in m["rois"].items() if have[j, roi]]
+        for i in range(0, len(items), CROP_BATCH):
+            part = items[i:i + CROP_BATCH]
+            j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
+            x = _padded(x_all[j, roi], CROP_BATCH).float() / 255
+            with torch.autocast(**amp):
+                p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH)).float())
+            out += [(m["name"], st, c, float(v)) for (_, _, _, _, st, c), v in zip(part, p[:len(part)].tolist())]
+        dt = time.time() - t
+        timer["models"] += dt
+        timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
     preds = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "p"])
     preds = preds.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
     series = series.assign(p_right=[s["p_right"] for s in ser],
@@ -362,13 +390,18 @@ def process_chunk(studies, models, timer):
 
 
 def run_shard(df, weights, recipe, out_dir, workers):
-    torch.backends.cudnn.benchmark = True
+    # No cudnn.benchmark: it buys nothing at these shapes, and timing every algorithm of every
+    # new conv shape cost ~9 s on an H100 and ~2 min on a T4.
+    torch.backends.cudnn.benchmark = False
     torch.set_num_threads(1)
     dev = torch.device("cuda")
     t0 = time.time()
     models = Models(weights, recipe, dev)
-    timer = dict.fromkeys(["load", "wait", "prep", "side", "unet", "boxes", "consensus", "crops", "models"], 0.0)
+    timer = dict.fromkeys(["load", "warmup", "wait", "prep", "side", "unet", "boxes", "consensus", "crops", "models"], 0.0)
     timer["load"] = time.time() - t0
+    t = time.time()
+    models.warmup()
+    timer["warmup"] = time.time() - t
     loader = DataLoader(StudyDataset(df), batch_size=1, collate_fn=_first, num_workers=workers,
                         prefetch_factor=4 if workers else None, persistent_workers=False)
     all_series, all_boxes, all_preds, chunk = [], [], [], []

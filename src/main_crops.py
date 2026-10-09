@@ -87,6 +87,11 @@ def main():
     args.output_dir = broadcast_object(out, device=ctx.device)
     if ctx.is_main:
         create_logger(directory=args.output_dir, name="logs.txt")
+        # Through-plane sampling of the crop set (crops.prepare), which inference must reproduce.
+        from crops.prepare import CROP_DIR, DEPTH
+        meta = os.path.join(CROP_DIR, args.crops.split(",")[0] + ".json")
+        args.z_sampling = json.load(open(meta)) if os.path.exists(meta) else \
+            dict(depth=DEPTH, z_mode="uniform", stride=1)
         json.dump(vars(args), open(os.path.join(args.output_dir, "args.json"), "w"), indent=4, default=str)
 
     crops, info = load_crops(args.crops)
