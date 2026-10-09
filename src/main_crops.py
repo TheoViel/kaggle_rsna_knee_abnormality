@@ -15,12 +15,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
 
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
 from crops.train import GROUPS, CropDataset, Crop25D, fit, load_crops  # noqa: E402
 from knee_cls.data import load_tables, make_splits  # noqa: E402
-from params import LOG_FOLDER  # noqa: E402
+from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
                                   seed_everything, worker_init_fn)
 from utils.logger import create_logger, prepare_log_folder  # noqa: E402
@@ -30,10 +31,35 @@ DEFAULTS = {
     "head": "lstm", "hidden": 256, "dropout": 0.2, "drop_path": 0.1,
     "epochs": 10, "batch_size": 32, "lr": 5e-4, "lr_backbone": 1e-4, "weight_decay": 0.05,
     "planes": "Sagittal,Coronal", "num_workers": 8, "seed": 0,
+    "labels": "claude",
+    "fullfit": False,
     "augmentations": {"rot_deg": 15.0, "scale_range": (0.85, 1.15), "shift": 0.08,
                       "gamma": 0.3, "contrast": 0.25, "brightness": 0.1},
     "log_path": LOG_FOLDER + "crops_run/",
 }
+
+
+def training_targets(which, studies, classes):
+    """Soft training labels per finding: Claude report labels, Codex ones, their mean, or pseudo-labels (`pl:<name>`).
+
+    Codex covers every non-radiologist study (input/codex-labels_final_4349.csv)
+    and 52 of the 58 radiologist ones; those are validation-only, so training is
+    unaffected. Validation keeps scoring against the Claude labels (`hold`) so
+    that runs stay comparable.
+    """
+    claude = studies.set_index("StudyInstanceUID")
+    if which.startswith("pl:"):
+        # Pseudo-labels: output/crops/<name>.csv, StudyInstanceUID x findings (crops/predict.py + teacher averaging).
+        pl = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{which[3:]}.csv")).set_index("StudyInstanceUID")
+        return {c: pl[c] for c in classes}
+    if which == "claude":
+        return {c: claude[f"target_{c}"] for c in classes}
+    codex = pd.concat([pd.read_csv(f"{INPUT_FOLDER}codex-labels_final_{n}.csv") for n in (52, 4349)])
+    codex = codex.set_index("StudyInstanceUID")
+    if which == "codex":
+        return {c: codex[c] for c in classes}
+    assert which == "mean", which
+    return {c: (claude[f"target_{c}"] + codex[c].reindex(claude.index)) / 2 for c in classes}
 
 
 def parse_args():
@@ -69,10 +95,23 @@ def main():
     _, gt_ids, hold_ids = make_splits(studies, holdout_frac=0.1, seed=0)
     val_mask = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
     classes = GROUPS[args.group]
-    targets = {c: studies.set_index("StudyInstanceUID")[f"target_{c}"] for c in classes}
-    train_ds = CropDataset(crops, info[~val_mask], classes, targets)
-    val_ds = CropDataset(crops, info[val_mask], classes, targets)
+    targets = training_targets(args.labels, studies, classes)
+    if args.fullfit:
+        # Fullfit (submission models): every study is trained on. The 58 radiologist studies
+        # take their radiologist labels; every other study keeps the chosen soft labels.
+        st_ = studies.set_index("StudyInstanceUID")
+        for c in classes:
+            t = targets[c].reindex(st_.index)
+            gt = st_[f"gt_{c}"]
+            targets[c] = t.where(gt.isna(), gt)
+        train_ds = CropDataset(crops, info, classes, targets)
+    else:
+        train_ds = CropDataset(crops, info[~val_mask], classes, targets)
+    # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
+    val_ds = CropDataset(crops, info[val_mask], classes, training_targets("claude", studies, classes))
     if ctx.is_main:
+        if args.fullfit:
+            print("-> FULLFIT: validation studies are trained on, validation scores below are leaky")
         print(f"-> {args.output_dir}  group {args.group} {classes}  backbone {args.backbone}\n"
               f"- train {len(train_ds)} crops  val {len(val_ds)} crops")
 

@@ -2,11 +2,11 @@
 
     python -m infer.seg --out_dir /tmp/knee/ --weights <ROI U-Net run dir>
 
-Per series: the volume (training left-right convention, see `infer.prep`) is
-flipped to a right knee when its predicted side is left, run through the ROI
-U-Net, and the probabilities are flipped back -- all the way to the series' own
-stored orientation (convention flip XOR side flip, both along the left-right
-axis). Then exactly one box per class (`roi.train.prob_to_boxes`), converted to
+Per series: the volume (already in the training left-right convention, see
+`infer.prep`) is flipped to a right knee when its predicted side is left, run
+through the ROI U-Net, and the probabilities are flipped back all the way to the
+series' own stored orientation: side flip XOR convention flip, both along the
+left-right axis. Then exactly one box per class (`roi.train.prob_to_boxes`), converted to
 original voxel indices (`roi.geometry.from_volume`).
 
 Per box confidence and repair, within one knee -- the series of a study with the
@@ -54,14 +54,18 @@ def predict_boxes(vols, rows, weights, device="cuda", batch=16, threshold=0.5):
     out = []
     for i in range(0, len(rows), batch):
         part = rows.iloc[i:i + batch]
-        flips = (part.conv_flip.astype(bool) ^ part.side.eq("L")).to_numpy()
+        # volumes.npy is already in the training left-right convention (infer.prep), so the
+        # input only needs the knee-side flip. The output goes back to the series' *stored*
+        # orientation, which the boxes are written in: side flip, then convention flip.
+        side_flip = part.side.eq("L").to_numpy()
+        back_flip = side_flip ^ part.conv_flip.astype(bool).to_numpy()
         x = np.stack([np.flip(vols[r], _lr_axis(p)) if f else np.asarray(vols[r])
-                      for r, p, f in zip(part.row, part.plane, flips)])
+                      for r, p, f in zip(part.row, part.plane, side_flip)])
         xt = torch.from_numpy(np.ascontiguousarray(x))[:, None].to(device).float() / 255
         with torch.autocast(device.split(":")[0], dtype=amp_dtype()):
             prob = torch.sigmoid(model(xt).float()).cpu().numpy()
         for j, r in enumerate(part.itertuples()):
-            p = np.flip(prob[j], _lr_axis(r.plane) + 1) if flips[j] else prob[j]
+            p = np.flip(prob[j], _lr_axis(r.plane) + 1) if back_flip[j] else prob[j]
             for k, (vb, conf, p_mean) in enumerate(prob_to_boxes(p, threshold)):
                 out.append(dict(StudyInstanceUID=r.StudyInstanceUID, SeriesInstanceUID=r.SeriesInstanceUID,
                                 plane=r.plane, side=r.side, **{"class": classes[k]}, conf=conf, p_mean=p_mean,
@@ -69,19 +73,13 @@ def predict_boxes(vols, rows, weights, device="cuda", batch=16, threshold=0.5):
     return pd.DataFrame(out)
 
 
-def run(out_dir, weights, device="cuda"):
-    from roi.consensus import _world, add_confidence, fill_by_registration
+def consensus(pred, rows):
+    """U-Net boxes of whole studies (`predict_boxes`) -> rois.csv rows: confidence, registration fill.
 
-    t0 = time.time()
-    series = pd.read_csv(os.path.join(out_dir, "series.csv"))
-    lat = pd.read_csv(os.path.join(out_dir, "series_laterality.csv"))
-    rows = series[(series.status == "ok") & series.plane.isin(ROI_PLANES)].merge(
-        lat[["SeriesInstanceUID", "side"]], on="SeriesInstanceUID")
-    with open(os.path.join(out_dir, "geometry.json")) as f:
-        kr.GEOMETRY_OVERRIDE.update(json.load(f))
-    vols = np.load(os.path.join(out_dir, "volumes.npy"), mmap_mode="r")
-    pred = predict_boxes(vols, rows, weights, device)
-    t1 = time.time()
+    rows: the studies' sagittal / coronal series (series.csv rows + side). Works
+    knee by knee, so any set of whole studies gives the same result.
+    """
+    from roi.consensus import add_confidence, fill_by_registration
 
     # Consensus within a knee: the study key carries the side.
     knee = lambda d: d.StudyInstanceUID + "|" + d.side  # noqa: E731
@@ -97,8 +95,22 @@ def run(out_dir, weights, device="cuda"):
     cols = ["StudyInstanceUID", "SeriesInstanceUID", "plane", "side", "class"] + BOX + \
         ["conf", "p_mean", "support", "iou_other_plane", "iou_same_plane", "confidence", "source"]
     filled = filled.reindex(columns=cols).sort_values(["StudyInstanceUID", "SeriesInstanceUID", "class"])
+    return filled, int(weak.sum()), n_filled
+
+
+def run(out_dir, weights, device="cuda"):
+    t0 = time.time()
+    series = pd.read_csv(os.path.join(out_dir, "series.csv"))
+    lat = pd.read_csv(os.path.join(out_dir, "series_laterality.csv"))
+    rows = series[(series.status == "ok") & series.plane.isin(ROI_PLANES)].merge(
+        lat[["SeriesInstanceUID", "side"]], on="SeriesInstanceUID")
+    with open(os.path.join(out_dir, "geometry.json")) as f:
+        kr.GEOMETRY_OVERRIDE.update(json.load(f))
+    vols = np.load(os.path.join(out_dir, "volumes.npy"), mmap_mode="r")
+    pred = predict_boxes(vols, rows, weights, device)
+    t1 = time.time()
+    filled, n_fail, n_filled = consensus(pred, rows)
     filled.to_csv(os.path.join(out_dir, "rois.csv"), index=False)
-    n_fail = int(weak.sum())
     print(f"-> {len(filled)} ROIs for {filled.SeriesInstanceUID.nunique()} series "
           f"({len(rows)} sagittal / coronal) in {time.time() - t0:.0f}s (U-Net {t1 - t0:.0f}s); "
           f"{n_fail} below the 0.5 threshold, {n_filled} of them replaced by registration; "

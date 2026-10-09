@@ -17,10 +17,18 @@ logs/
 ensemble/
 weights/
 dataset/
-dataset_2/
-clean-approach-lightweight-local-cv-no-hack/
-hoct/
+dataset_*/
 public/
 dataset_preds*
-kaggle-czii-4th/
-zebrahub_raw/
+models/
+third_party/
+jiwei-code/
+
+# Extensions
+*.csv
+*.txt
+*.zip
+*.pth
+*.pt
+*.pkl
+*.npy

@@ -73,12 +73,18 @@ def prob_to_boxes(prob, threshold):
     for p in prob:
         conf = float(p.max())
         region = p >= (threshold if conf >= threshold else 0.5 * conf)
+        # Label inside the region's bounding box only: same components, same raster
+        # order (so the same argmax on ties), ~10x less work than the whole volume.
+        sl = tuple(slice(i[0], i[-1] + 1) for i in
+                   (np.flatnonzero(region.any(axis=tuple(b for b in range(3) if b != a))) for a in range(3)))
+        p, region = p[sl], region[sl]
         lab, n = ndi.label(region, structure=np.ones((3, 3, 3)))
         mass = ndi.sum(p, lab, index=np.arange(1, n + 1))
         comp = lab == int(np.argmax(mass)) + 1
         zs, ys, xs = np.nonzero(comp)
-        out.append((dict(z0=zs.min(), z1=zs.max(), y0=ys.min(), y1=ys.max(),
-                         x0=xs.min(), x1=xs.max()), conf, float(p[comp].mean())))
+        oz, oy, ox = (s.start for s in sl)
+        out.append((dict(z0=zs.min() + oz, z1=zs.max() + oz, y0=ys.min() + oy, y1=ys.max() + oy,
+                         x0=xs.min() + ox, x1=xs.max() + ox), conf, float(p[comp].mean())))
     return out
 
 

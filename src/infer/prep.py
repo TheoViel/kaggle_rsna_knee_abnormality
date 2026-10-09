@@ -23,6 +23,8 @@ Writes to --out_dir:
   instances.csv   SeriesInstanceUID, slice_idx, SOPInstanceUID: which file each
                   slice index of the boxes refers to
   geometry.json   per series, the geometry for patient-space comparisons
+  cache/<SeriesInstanceUID>.npy   the 384 px uint8 cache (stored orientation), which
+                  the ROI crops are cut from (~4.5 MB per series; --no_cache to skip)
 """
 
 import argparse
@@ -86,7 +88,7 @@ def process(job):
     from roi.prepare import cache_to_volume
 
     torch.set_num_threads(1)
-    study, series, folder, plane = job
+    study, series, folder, plane, cache_dir = job
     try:
         vol, dss, major, tag = read_series(folder)
         plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
@@ -94,6 +96,9 @@ def process(job):
                                     [d.ImagePositionPatient for d in dss],
                                     dss[0].PixelSpacing, dss[0].get("SliceThickness"))
         cache = preprocess_volume(vol)
+        if cache_dir:
+            # The 384 px cache the ROI crops are cut from (stored orientation, before any flip).
+            np.save(os.path.join(cache_dir, f"{series}.npy"), cache)
         volume = cache_to_volume(cache)
         d = np.array(geom["direction"]).reshape(3, 3)
         # Training convention: sagittal slices towards patient right (-x), columns towards left (+x).
@@ -110,9 +115,13 @@ def process(job):
                           status=f"failed: {e!r}"[:300]), None, []
 
 
-def run(data_dir, out_dir, workers=None, limit=None, csv_name="test_series.csv", series_dir="test_series"):
+def run(data_dir, out_dir, workers=None, limit=None, csv_name="test_series.csv", series_dir="test_series",
+        series_csv=None, save_cache=True):
     os.makedirs(out_dir, exist_ok=True)
-    meta_csv = os.path.join(data_dir, csv_name)
+    cache_dir = os.path.join(out_dir, "cache") if save_cache else None
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    meta_csv = series_csv or os.path.join(data_dir, csv_name)
     if os.path.exists(meta_csv):
         df = pd.read_csv(meta_csv)
     else:                                  # no series csv: walk the folders, plane from geometry
@@ -123,7 +132,7 @@ def run(data_dir, out_dir, workers=None, limit=None, csv_name="test_series.csv",
         df = df[df.StudyInstanceUID.isin(df.StudyInstanceUID.drop_duplicates()[:limit])]
     jobs = [(r.StudyInstanceUID, r.SeriesInstanceUID,
              os.path.join(data_dir, series_dir, r.StudyInstanceUID, r.SeriesInstanceUID),
-             getattr(r, "Anatomical_Plane", "")) for r in df.itertuples()]
+             getattr(r, "Anatomical_Plane", ""), cache_dir) for r in df.itertuples()]
     vols = np.lib.format.open_memmap(os.path.join(out_dir, "volumes.npy"), mode="w+", dtype=np.uint8,
                                      shape=(len(jobs), DEPTH, SIZE, SIZE))
     metas, geoms, inst = [], {}, []
@@ -161,8 +170,10 @@ def main():
     p.add_argument("--limit", type=int, default=None, help="first N studies (debugging)")
     p.add_argument("--csv_name", default="test_series.csv")
     p.add_argument("--series_dir", default="test_series")
+    p.add_argument("--series_csv", default=None, help="series list to use instead of <data_dir>/<csv_name>")
+    p.add_argument("--no_cache", action="store_true", help="do not save the 384 px caches (no ROI classification)")
     a = p.parse_args()
-    run(a.data_dir, a.out_dir, a.workers, a.limit, a.csv_name, a.series_dir)
+    run(a.data_dir, a.out_dir, a.workers, a.limit, a.csv_name, a.series_dir, a.series_csv, not a.no_cache)
 
 
 if __name__ == "__main__":

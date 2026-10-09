@@ -33,7 +33,7 @@ jobs:
 
         with:
           id: "${{ secrets.KAGGLE_USERNAME }}/rsna-knee-code"
-          title: "Biohub Cell Tracking Code"
+          title: "RSNA Knee Code"
           subtitle: "Uploaded via github action"
           description: ""
           files: repo.zip
