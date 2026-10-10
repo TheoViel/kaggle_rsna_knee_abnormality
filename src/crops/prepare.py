@@ -58,6 +58,15 @@ def crop_window(n_c, cs, box, n_slices, rows, cols, depth=DEPTH, margin=MARGIN, 
     side = max(side, min_side)
     y0, x0 = int(round(cy - side / 2)), int(round(cx - side / 2))
     n = int(round(side))
+    if "x_lo" in box or "x_hi" in box:
+        # Compartment crops (oa_midline): slide the window so it stays on its side of the
+        # intercondylar midline; it keeps its size and gains periphery instead.
+        lo = (box["x_lo"] + ox) * f if "x_lo" in box else -np.inf
+        hi = (box["x_hi"] + 1 + ox) * f if "x_hi" in box else np.inf
+        if x0 + n > hi:
+            x0 = int(round(hi - n))
+        if x0 < lo:
+            x0 = int(round(lo))
     # Slices: box range widened by one, mapped to cache indices.
     zc = (lambda z: z * (n_c - 1) / max(n_slices - 1, 1)) if n_c != n_slices else (lambda z: z)
     if z_mode == "strided":
@@ -99,17 +108,107 @@ def crop_box(cache, box, n_slices, rows, cols, flip, sagittal, depth=DEPTH, size
     return np.ascontiguousarray(out)
 
 
+def capsule_boxes(pred, expand=0.0, expand_up=None, shape=None, classes=None):
+    """Per series, one "Capsule" box: the union of its ROI boxes, widened in-plane by `expand`
+    x its height / width on each side (`expand_up` for the top, superior edge), clipped to
+    the image (`shape`: series -> (rows, cols)). Slices: the union's range, unchanged.
+
+    Effusion and synovitis have no box of their own, but they live in the joint capsule,
+    which the eight ROIs (menisci, compartments, ligaments, patellofemoral joint, Baker's)
+    outline; the suprapatellar recess reaches above the patella, hence the separate
+    superior margin.
+    """
+    up = expand if expand_up is None else expand_up
+    if classes:                       # union of these ROIs only (e.g. the tibiofemoral joint)
+        pred = pred[pred["class"].isin(classes)]
+    out = {}
+    for uid, g in pred.groupby("SeriesInstanceUID"):
+        b = dict(z0=int(g.z0.min()), z1=int(g.z1.max()), y0=g.y0.min(), y1=g.y1.max(), x0=g.x0.min(), x1=g.x1.max())
+        h, w = b["y1"] - b["y0"] + 1, b["x1"] - b["x0"] + 1
+        rows, cols = shape[uid]
+        b.update(y0=int(max(0, round(b["y0"] - up * h))), y1=int(min(rows - 1, round(b["y1"] + expand * h))),
+                 x0=int(max(0, round(b["x0"] - expand * w))), x1=int(min(cols - 1, round(b["x1"] + expand * w))))
+        out[uid] = {"Capsule": b}
+    return out
+
+
+def oa_midline(bx, clip=False):
+    """Medial / lateral OA boxes of a coronal or axial series -> the same boxes with the column
+    limit of their side of the knee: the midline halfway between the two menisci boxes' inner
+    edges. Columns run left-right in both planes (sagittal series need nothing: left-right is
+    the slice axis, and their OA crops stay inside their compartment)."""
+    if not {"Medial Meniscus", "Lateral Meniscus"} <= set(bx):
+        return bx
+    mm, lm = bx["Medial Meniscus"], bx["Lateral Meniscus"]
+    med_left = (mm["x0"] + mm["x1"]) < (lm["x0"] + lm["x1"])
+    mid = (mm["x1"] + lm["x0"]) / 2 if med_left else (lm["x1"] + mm["x0"]) / 2
+    out = dict(bx)
+    for c, left in (("Medial OA", med_left), ("Lateral OA", not med_left)):
+        if c in out:
+            b = {**out[c], **({"x_hi": mid} if left else {"x_lo": mid})}
+            if clip:                  # the box itself stops at the midline too (smaller, tighter crop)
+                if left:
+                    b["x1"] = int(max(b["x0"], min(b["x1"], np.floor(mid))))
+                else:
+                    b["x0"] = int(min(b["x1"], max(b["x0"], np.ceil(mid))))
+            out[c] = b
+    return out
+
+
+def notch_box(bx, plane, shape, n_slices, union=False):
+    """The intercondylar notch, where the ACL runs, from the two meniscus boxes (reliable),
+    instead of the U-Net's ACL box (learned from attention maps that favoured the bone bruise
+    on the posterolateral tibial plateau). `union`: joined with the U-Net ACL box (keeps the
+    bruise as well).
+
+    Sagittal (left-right = slices): the slices between the two menisci, at least 5; in-plane
+    the menisci's anterior-posterior extent, from half their height above the joint line (the
+    notch roof) to a quarter below (tibial spines). Coronal (left-right = columns): the columns
+    between the menisci's inner edges, at least 20% of the joint's width; rows as above;
+    slices: the menisci's anterior-posterior range."""
+    if not {"Medial Meniscus", "Lateral Meniscus"} <= set(bx):
+        return bx
+    mm, lm = bx["Medial Meniscus"], bx["Lateral Meniscus"]
+    lr = "z" if plane == "Sagittal" else "x"
+    a, b = (mm, lm) if (mm[f"{lr}0"] + mm[f"{lr}1"]) < (lm[f"{lr}0"] + lm[f"{lr}1"]) else (lm, mm)
+    lo, hi = a[f"{lr}1"], b[f"{lr}0"]                     # inner edges
+    joint = b[f"{lr}1"] - a[f"{lr}0"] + 1
+    half = max((hi - lo) / 2, 2.5 if lr == "z" else 0.10 * joint)
+    mid = (lo + hi) / 2
+    y0, y1 = min(mm["y0"], lm["y0"]), max(mm["y1"], lm["y1"])
+    h = y1 - y0 + 1
+    out = {"y0": int(max(0, round(y0 - 0.5 * h))), "y1": int(min(shape[0] - 1, round(y1 + 0.25 * h)))}
+    lim = n_slices - 1 if lr == "z" else shape[1] - 1
+    out[f"{lr}0"], out[f"{lr}1"] = int(max(0, np.floor(mid - half))), int(min(lim, np.ceil(mid + half)))
+    other = "x" if lr == "z" else "z"
+    out[f"{other}0"], out[f"{other}1"] = min(mm[f"{other}0"], lm[f"{other}0"]), max(mm[f"{other}1"], lm[f"{other}1"])
+    if union and "ACL" in bx:
+        out = {k: (min if k.endswith("0") else max)(out[k], bx["ACL"][k]) for k in BOX}
+    return {**bx, "ACL": out}
+
+
+def compartment_box(oa, men, extend, shape):
+    """A tibiofemoral compartment: the OA box joined with the meniscus box of the same side,
+    extended by `extend` x its height above and below to take in the femoral condyle and the
+    tibial plateau (osteophytes, subchondral bone), clipped to the image."""
+    b = {k: (min if k.endswith("0") else max)(oa[k], men[k]) for k in BOX}
+    h = b["y1"] - b["y0"] + 1
+    b["y0"] = int(max(0, round(b["y0"] - extend * h)))
+    b["y1"] = int(min(shape[0] - 1, round(b["y1"] + extend * h)))
+    return b
+
+
 def _series(args):
     import torch
 
     torch.set_num_threads(1)
-    r, boxes, flip, z = args
+    r, boxes, flip, z, classes, size, margin = args
     cache = np.load(os.path.join(CACHE_DIR, f"{r['SeriesInstanceUID']}.npy"))
-    out = np.zeros((len(ROI_CLASSES), z["depth"], SIZE, SIZE), np.uint8)
-    for k, c in enumerate(ROI_CLASSES):
+    out = np.zeros((len(classes), z["depth"], size, size), np.uint8)
+    for k, c in enumerate(classes):
         if c in boxes:
             out[k] = crop_box(cache, boxes[c], r["n_slices"], r["rows"], r["cols"], flip,
-                              r["Anatomical_Plane"] == "Sagittal", **z)
+                              r["Anatomical_Plane"] == "Sagittal", size=size, margin=margin, **z)
     return out
 
 
@@ -124,6 +223,22 @@ def main():
     p.add_argument("--depth", type=int, default=DEPTH, help="frames per crop")
     p.add_argument("--z_mode", default="uniform", choices=["uniform", "strided", "resize"])
     p.add_argument("--stride", type=int, default=1, help="slices between frames (strided)")
+    p.add_argument("--size", type=int, default=SIZE, help="crop side, px")
+    p.add_argument("--capsule", type=float, default=None,
+                   help="one Capsule crop per series instead of the 8 ROIs, the ROI union widened by this fraction")
+    p.add_argument("--capsule_up", type=float, default=None, help="superior widening (default: --capsule)")
+    p.add_argument("--union", default="", help="with --capsule: comma-separated ROIs whose union is the box "
+                                               "(default: all 8)")
+    p.add_argument("--margin", type=float, default=MARGIN, help="in-plane context around ROI boxes (x side)")
+    p.add_argument("--oa_midline", default="", choices=["", "slide", "clip"],
+                   help="coronal / axial medial and lateral OA crops stop at the intercondylar midline "
+                        "(slide: the window moves outward; clip: the box is also cut at the midline)")
+    p.add_argument("--acl_notch", default="", choices=["", "notch", "union"],
+                   help="replace the ACL box by the intercondylar notch from the menisci boxes "
+                        "(union: notch joined with the U-Net ACL box)")
+    p.add_argument("--compartment", type=float, default=None,
+                   help="medial / lateral OA boxes: union with the same side's meniscus box, then extended "
+                        "by this fraction of its height above and below (femur, tibia)")
     a = p.parse_args()
     z = dict(depth=a.depth, z_mode=a.z_mode, stride=a.stride)
     os.makedirs(CROP_DIR, exist_ok=True)
@@ -131,13 +246,46 @@ def main():
     pred = pd.read_csv(os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
     pred = pred[pred.z0.notna()]
     boxes = {}
-    for r in pred.to_dict("records"):
-        boxes.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in BOX}
+    if a.capsule is not None:
+        # The box is the whole field of view of interest: square crop of its larger side, no margin.
+        classes, margin = ["Capsule"], 0.0
+        shape = {r.SeriesInstanceUID: (r.rows, r.cols) for r in vols.itertuples()}
+        union = [c for c in a.union.split(",") if c]
+        boxes = capsule_boxes(pred, a.capsule, a.capsule_up, shape, union or None)
+        z.update(capsule=a.capsule, capsule_up=a.capsule_up, **({"union": a.union} if union else {}))
+    else:
+        classes, margin = list(ROI_CLASSES), a.margin
+        for r in pred.to_dict("records"):
+            boxes.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in BOX}
+        if a.compartment is not None:
+            shape = {r.SeriesInstanceUID: (r.rows, r.cols) for r in vols.itertuples()}
+            for uid, bx in boxes.items():
+                for oa, men in (("Medial OA", "Medial Meniscus"), ("Lateral OA", "Lateral Meniscus")):
+                    if oa in bx and men in bx and uid in shape:
+                        bx[oa] = compartment_box(bx[oa], bx[men], a.compartment, shape[uid])
+            z.update(compartment=a.compartment)
+        if a.acl_notch:
+            meta = {r.SeriesInstanceUID: r for r in vols.itertuples()}
+            for uid in list(boxes):
+                r = meta.get(uid)
+                if r is not None and r.Anatomical_Plane in ("Sagittal", "Coronal"):
+                    boxes[uid] = notch_box(boxes[uid], r.Anatomical_Plane, (r.rows, r.cols), r.n_slices,
+                                           union=a.acl_notch == "union")
+            z.update(acl_notch=a.acl_notch)
+        if a.oa_midline:
+            plane = dict(zip(vols.SeriesInstanceUID, vols.Anatomical_Plane))
+            for uid in list(boxes):
+                if plane.get(uid) in ("Coronal", "Axial"):
+                    boxes[uid] = oa_midline(boxes[uid], clip=a.oa_midline == "clip")
+            z.update(oa_midline=a.oa_midline)
+        z.update(margin=a.margin)
+    z["size"] = a.size
     side = series_side()
-    jobs = [(r, boxes.get(r["SeriesInstanceUID"], {}), side.get(r["SeriesInstanceUID"]) == "L", z)
-            for r in vols.to_dict("records")]
+    zc = {k: z[k] for k in ("depth", "z_mode", "stride")}
+    jobs = [(r, boxes.get(r["SeriesInstanceUID"], {}), side.get(r["SeriesInstanceUID"]) == "L", zc, classes, a.size,
+             margin) for r in vols.to_dict("records")]
     arr = np.lib.format.open_memmap(os.path.join(CROP_DIR, f"{a.name}.npy"), mode="w+", dtype=np.uint8,
-                                    shape=(len(jobs), len(ROI_CLASSES), a.depth, SIZE, SIZE))
+                                    shape=(len(jobs), len(classes), a.depth, a.size, a.size))
     with ProcessPoolExecutor(96) as ex:
         for i, c in enumerate(ex.map(_series, jobs, chunksize=8)):
             arr[i] = c
@@ -148,7 +296,7 @@ def main():
         os.path.join(CROP_DIR, f"{a.name}.csv"), index=False)
     with open(os.path.join(CROP_DIR, f"{a.name}.json"), "w") as f:      # sampling, for inference
         json.dump(z, f)
-    print(f"-> {len(jobs)} series x {len(ROI_CLASSES)} ROIs x {a.depth} x {SIZE} x {SIZE} ({z}) in {CROP_DIR}")
+    print(f"-> {len(jobs)} series x {len(classes)} ROIs x {a.depth} x {a.size} x {a.size} ({z}) in {CROP_DIR}")
 
 
 if __name__ == "__main__":

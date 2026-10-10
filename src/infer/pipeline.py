@@ -4,7 +4,9 @@
         --submission submission.csv --gpus 0,1
 
 <weights> holds side/ and roi/ (run folders), crops/<run>/ (args.json + ckpt_final.pt)
-and recipe.json ({finding: [crop run, ...]}).
+and recipe.json ({finding: [crop run, ...]}, or {finding: {"models": [...], "minus": {"finding": f,
+"beta": b}}} to subtract b x finding f's combined score: the medial / lateral OA cross-talk
+correction, see experiments.md section 14).
 
 The operations of `infer.prep` -> `infer.side` -> `infer.seg` -> `infer.classify`,
 reorganised for a small machine (Kaggle: 2 x T4, 4 CPU cores):
@@ -188,17 +190,21 @@ def _lr_axis(plane):
     return 0 if plane == "Sagittal" else 2          # of a (D, S, S) volume
 
 
-def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal, depth=12, z_mode="uniform", stride=1):
-    """`crops.prepare.crop_box` of every ROI with a box -> (K, depth, 128, 128) uint8, have (K,)."""
-    from crops.prepare import SIZE, crop_window
+def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal, depth=12, z_mode="uniform", stride=1,
+              size=128, classes=ROI_CLASSES, margin=None):
+    """`crops.prepare.crop_box` of every class with a box -> (K, depth, size, size) uint8, have (K,)."""
+    from crops.prepare import MARGIN, crop_window
 
+    SIZE = size
+    margin = MARGIN if margin is None else margin
     n_c, cs = cache.shape[0], cache.shape[1]
-    out = torch.zeros((len(ROI_CLASSES), depth, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
-    have = np.zeros(len(ROI_CLASSES), bool)
-    for k, c in enumerate(ROI_CLASSES):
+    out = torch.zeros((len(classes), depth, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
+    have = np.zeros(len(classes), bool)
+    for k, c in enumerate(classes):
         if c not in boxes:
             continue
-        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols, depth, z_mode=z_mode, stride=stride)
+        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols, depth, margin=margin, z_mode=z_mode,
+                                    stride=stride)
         win = torch.zeros((depth, n, n), dtype=torch.float32, device=cache.device)
         ys, xs, ye, xe = max(y0, 0), max(x0, 0), min(y0 + n, cs), min(x0 + n, cs)
         if ye > ys and xe > xs:
@@ -229,7 +235,7 @@ def _padded(x, n):
 
 class Models:
     def __init__(self, weights, recipe, device):
-        from crops.train import GROUPS, PLANES, Crop25D
+        from crops.train import GROUPS, PLANES, build_model as build_crop_model, crop_index
         from roi.train import build_model
         from side_cls import SideNet
 
@@ -245,23 +251,26 @@ class Models:
         self.unet.load_state_dict(sd)
         self.unet = self.unet.to(device).eval()
         self.crops = []
-        for m in sorted({m for ms in recipe.values() for m in ms}):
+        for m in sorted({m for r in recipe.values() for m in r["models"]}):
             d = os.path.join(weights, "crops", m)
             a = json.load(open(os.path.join(d, "args.json")))
             group = GROUPS[a["group"]]
             sd = torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu")
-            net = Crop25D(a["backbone"], len(group), pretrained=False, img_size=a.get("img_size") or None,
-                          hidden=a.get("hidden", 256), dropout=0.0, drop_path=0.0, head=a.get("head", "lstm"))
+            net = build_crop_model(a, len(group))
             n_planes = sd["plane_embed.weight"].shape[0]
             if n_planes != net.plane_embed.num_embeddings:     # runs from before axial crops: 2 planes
                 net.plane_embed = nn.Embedding(n_planes, net.plane_embed.embedding_dim)
             net.load_state_dict(sd)
-            net = net.to(device).eval().to(memory_format=torch.channels_last)
-            used = [c for c in group if m in recipe.get(c, [])]     # findings the recipe takes from it
+            net = net.to(device).eval()
+            if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
+                net = net.to(memory_format=torch.channels_last)
+            used = [c for c in group if c in recipe and m in recipe[c]["models"]]     # findings taken from it
             z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
+            z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
+                                   "compartment", "oa_midline", "union") if k in z}
             self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
                                    planes_all=PLANES,
-                                   rois={c: (ROI_CLASSES.index(c), group.index(c)) for c in used}))
+                                   rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
 
 
     @torch.no_grad()
@@ -274,7 +283,8 @@ class Models:
             self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
             for m in self.crops:
                 i = z(CROP_BATCH, dtype=torch.long, device=self.device)
-                m["net"](z((CROP_BATCH, json.loads(m["z"])["depth"], 128, 128), device=self.device), i, i)
+                k = json.loads(m["z"])
+                m["net"](z((CROP_BATCH, k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device), i, i)
         torch.cuda.synchronize()
 
 
@@ -351,10 +361,38 @@ def process_chunk(studies, models, timer):
     crop_rows = [s for s in ser if s["SeriesInstanceUID"] in by_series]
     crops = {}                            # sampling -> (crops (N, K, D, S, S), have (N, K))
     for z in {m["z"] for m in models.crops}:
+        kw = json.loads(z)
+        cap, cap_up = kw.pop("capsule", None), kw.pop("capsule_up", None)
+        compartment, midline = kw.pop("compartment", None), kw.pop("oa_midline", "")
+        union = [c for c in kw.pop("union", "").split(",") if c]
+        if cap is not None:               # effusion / synovitis: one capsule crop around the ROI union
+            from crops.prepare import capsule_boxes
+
+            shape = {s["SeriesInstanceUID"]: (s["rows"], s["cols"]) for s in crop_rows}
+            src = boxes[boxes.SeriesInstanceUID.isin(shape)]      # axial: union of its registered boxes
+            series_boxes = capsule_boxes(src, cap, cap_up, shape, union or None)
+            kw.update(classes=["Capsule"], margin=0.0)
+        else:
+            series_boxes = by_series
+            if compartment is not None or midline:
+                # OA compartment crops, exactly as crops.prepare --compartment / --oa_midline built them.
+                from crops.prepare import compartment_box, oa_midline
+
+                series_boxes = {}
+                for s in crop_rows:
+                    uid = s["SeriesInstanceUID"]
+                    bx = dict(by_series.get(uid, {}))
+                    if compartment is not None and s["plane"] != "Axial":
+                        for oa, men in (("Medial OA", "Medial Meniscus"), ("Lateral OA", "Lateral Meniscus")):
+                            if oa in bx and men in bx:
+                                bx[oa] = compartment_box(bx[oa], bx[men], compartment, (s["rows"], s["cols"]))
+                    if midline and s["plane"] in ("Coronal", "Axial"):
+                        bx = oa_midline(bx, clip=midline == "clip")
+                    series_boxes[uid] = bx
         cs, have = [], []
         for s in crop_rows:
-            c, h = gpu_crops(s["cache"], by_series[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
-                             (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", **json.loads(z))
+            c, h = gpu_crops(s["cache"], series_boxes.get(s["SeriesInstanceUID"], {}), s["n_slices"], s["rows"],
+                             s["cols"], (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", **kw)
             cs.append(c)
             have.append(h)
         if cs:
@@ -444,23 +482,36 @@ def run_shard(df, weights, recipe, out_dir, workers):
           ", ".join(f"{k} {v:.0f}s" for k, v in timer.items()), flush=True)
 
 
+def load_recipe(path):
+    """recipe.json -> {finding: {"models": [...], "minus": {"finding": f, "beta": b} or None}}."""
+    with open(path) as f:
+        r = json.load(f)
+    return {c: (dict(models=v, minus=None) if isinstance(v, list) else dict(models=v["models"], minus=v.get("minus")))
+            for c, v in r.items()}
+
+
 def combine(preds, recipe, studies):
     """Per-model study probabilities -> one column per finding: a single model's probability,
-    or the mean of several models' ranks over the test studies."""
+    or the mean of several models' ranks over the test studies; then the cross-talk
+    corrections (score - beta x another finding's combined score)."""
     tab = {m: g.pivot(index="StudyInstanceUID", columns="cls", values="p") for m, g in preds.groupby("model")}
     study = pd.DataFrame(index=pd.Index(studies, name="StudyInstanceUID"))
-    for c, ms in recipe.items():
+    for c, r in recipe.items():
         cols = [tab[m][c].reindex(study.index) if m in tab and c in tab[m] else
-                pd.Series(np.nan, index=study.index) for m in ms]
+                pd.Series(np.nan, index=study.index) for m in r["models"]]
         study[c] = cols[0] if len(cols) == 1 else sum(col.rank(pct=True) for col in cols) / len(cols)
+    base = study.copy()
+    for c, r in recipe.items():
+        if r["minus"]:
+            # Back to [0, 1] as percentile ranks over the test studies (same order, valid probabilities).
+            study[c] = (base[c] - r["minus"]["beta"] * base[r["minus"]["finding"]]).rank(pct=True)
     return study
 
 
 def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_series", series_csv=None,
         limit=None):
     t0 = time.time()
-    with open(os.path.join(weights, "recipe.json")) as f:
-        recipe = json.load(f)
+    recipe = load_recipe(os.path.join(weights, "recipe.json"))
     df = list_series(data_dir, series_dir, series_csv)
     if limit:
         df = df[df.StudyInstanceUID.isin(df.StudyInstanceUID.drop_duplicates()[:limit])]
@@ -508,8 +559,7 @@ def main():
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     a = p.parse_args()
     if a.shard is not None:               # worker process, spawned by run()
-        with open(os.path.join(a.weights, "recipe.json")) as f:
-            recipe = json.load(f)
+        recipe = load_recipe(os.path.join(a.weights, "recipe.json"))
         df = pd.read_csv(os.path.join(a.out_dir, "series_list.csv"))
         df = df[df["shard"] == a.shard]
         run_shard(df, a.weights, recipe, os.path.join(a.out_dir, f"shard{a.shard}"), a.workers)

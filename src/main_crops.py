@@ -19,7 +19,7 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
-from crops.train import GROUPS, CropDataset, Crop25D, fit, load_crops  # noqa: E402
+from crops.train import GROUPS, CropDataset, build_model, fit, load_crops  # noqa: E402
 from knee_cls.data import load_tables, make_splits  # noqa: E402
 from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
@@ -28,7 +28,7 @@ from utils.logger import create_logger, prepare_log_folder  # noqa: E402
 
 DEFAULTS = {
     "group": "menisci", "crops": "r3", "backbone": "convnext_tiny.fb_in22k", "img_size": 0,
-    "head": "lstm", "hidden": 256, "dropout": 0.2, "drop_path": 0.1,
+    "head": "lstm", "fusion": "late", "hidden": 256, "dropout": 0.2, "drop_path": 0.1,
     "epochs": 10, "batch_size": 32, "lr": 5e-4, "lr_backbone": 1e-4, "weight_decay": 0.05,
     "planes": "Sagittal,Coronal", "num_workers": 8, "seed": 0,
     "labels": "claude",
@@ -85,13 +85,12 @@ def main():
         os.makedirs(args.log_path, exist_ok=True)
         out = prepare_log_folder(args.log_path)
     args.output_dir = broadcast_object(out, device=ctx.device)
+    # Through-plane sampling of the crop set (crops.prepare), which inference must reproduce.
+    from crops.prepare import CROP_DIR, DEPTH
+    meta = os.path.join(CROP_DIR, args.crops.split(",")[0] + ".json")
+    args.z_sampling = json.load(open(meta)) if os.path.exists(meta) else dict(depth=DEPTH, z_mode="uniform", stride=1)
     if ctx.is_main:
         create_logger(directory=args.output_dir, name="logs.txt")
-        # Through-plane sampling of the crop set (crops.prepare), which inference must reproduce.
-        from crops.prepare import CROP_DIR, DEPTH
-        meta = os.path.join(CROP_DIR, args.crops.split(",")[0] + ".json")
-        args.z_sampling = json.load(open(meta)) if os.path.exists(meta) else \
-            dict(depth=DEPTH, z_mode="uniform", stride=1)
         json.dump(vars(args), open(os.path.join(args.output_dir, "args.json"), "w"), indent=4, default=str)
 
     crops, info = load_crops(args.crops)
@@ -128,11 +127,12 @@ def main():
 
     train_dl, sampler = dl(train_ds, True)
     val_dl, _ = dl(val_ds, False)
-    model = Crop25D(args.backbone, len(classes), img_size=args.img_size or None, hidden=args.hidden,
-                    dropout=args.dropout, drop_path=args.drop_path, head=args.head).to(ctx.device)
+    model = build_model(vars(args), len(classes), pretrained=True).to(ctx.device)
     if ctx.distributed:
+        # One ROI embedding row, or modules a variant skips (early: the slice pooling; map3d: the encoder head).
+        unused = len(classes) == 1 or args.fusion == "early" or args.head == "map3d"
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ctx.device.index],
-                                                          find_unused_parameters=len(classes) == 1)
+                                                          find_unused_parameters=unused)
     try:
         tab = fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler)
         if ctx.is_main:

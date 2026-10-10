@@ -244,6 +244,24 @@ The rows above use the round-1 ROI models. The full sweep (backbones, 224 px, ax
 - Axial crops (boxes registered from sagittal + coronal, `python -m crops.axial_boxes`) help PF OA, ACL and MCL.
 - The mean / Codex labels help Baker's and slightly help the lateral meniscus.
 
+### Since then: 8-frame crops, aggregation, backbones, effusion / synovitis
+
+Details are in `experiments.md` sections 7–11. Scores are on the 58 radiologist studies.
+
+- **Pseudo-labels (section 7):** two rounds. Round 2 targets are 0.5 × the mean of the top-5 holdout models + 0.5 × the Claude/Codex mean. 8 ROI findings: 0.940 → 0.947.
+- **Frame sampling (section 8):** 8 adjacent slices centred on the ROI (stride 1) replace 12 uniform frames over the box.
+  - Submission recipe: 0.949 → **0.953**, with a third fewer frames to run.
+  - Each model records its sampling in `args.json`, and inference reproduces it.
+- **Slice aggregation (section 9):** the BiLSTM over slice vectors stays.
+  - A transformer, 3D convs over the last feature maps, and a temporal shift inside the encoder all tie with it.
+  - Early fusion (slices as channels) is 8× cheaper and costs 0.012.
+- **Backbones (section 10):** ConvNeXt-tiny stays. CAFormer-S18 (+0.003) is within noise. HGNetV2-B2 matches it with ¼ of the FLOPs. The mobile CNNs trail.
+- **Effusion and synovitis (section 11):** one capsule crop per series.
+  - The crop is the union of the 8 ROI boxes, widened 15% per side to include the suprapatellar recess, with 24 uniform frames at 160 px, through the same 2.5D model.
+  - Effusion reaches **0.980** (b1_c1 0.989, our baseline 0.959).
+  - Synovitis reaches 0.784 (b1_c1 0.851, baseline 0.791), and stays the weak finding.
+  - 3D models (the ROI U-Net's encoder, pretrained or from scratch) are worse on effusion and on the holdout.
+
 ---
 
 ## Inference
@@ -259,6 +277,17 @@ The rows above use the round-1 ROI models. The full sweep (backbones, 224 px, ax
 - **Output.** Per finding, the recipe's models are combined by rank average over the test studies. The 4 findings without an ROI stay at 0.5.
 
 The staged modules (`infer.prep` → `infer.side` → `infer.seg` → `infer.classify`) still exist and do the same operations.
+
+Weight folders (side classifier, ROI U-Net, fullfit crop models, `recipe.json`):
+
+| Folder | Crop models | Findings predicted (others at 0.5) | 58 AUC, same recipe with non-fullfit models |
+|---|---|---|---|
+| `output/dataset_1/` | 12 uniform frames, runs 63–69 | 8 ROI findings | 0.949 (8 ROI) |
+| `output/kaggle_weights/` | 8 strided frames, runs 85–91 | 8 ROI findings | 0.952 (8 ROI) |
+| `output/dataset_2/` | 85–91 + capsule fullfit `10/23`, `10/24` (2 seeds) | 8 ROI + effusion + synovitis | 0.938 (10), 0.865 (12) |
+| `output/dataset_3/` | dataset_2 + joint-crop fullfit `10/28` (sag + cor + axial) | all 12 | **0.939 (12)** |
+
+The two capsule models (24 frames × 160 px, one crop per sagittal or coronal series) cost ~0.9 TFLOP per study, about 40% of the 8-frame ROI crop models: roughly +1.5 min on 2×T4.
 
 Parity on the 58 radiologist studies (round-2 models, recipe C): **0.9486** fused fp16 vs 0.9488 staged. Per-finding correlation is ≥ 0.9986, and 95% of the U-Net boxes are identical.
 
@@ -300,8 +329,8 @@ Bottlenecks now:
 
 ## Next steps
 
-- Finish the crop-classifier sweep (backbones, resolution, axial), then ensemble seeds and backbones per finding.
-- Add the crop classifiers to the inference notebook to produce the 12-finding submission.
+- Contusion and fracture come from the joint crop (`experiments.md` section 12): 0.942 / 0.946 on the 58, vs b1_c1's 0.955 / 0.953. They need a decision before going into a submission (`output/dataset_3/`).
+- Synovitis: axial capsule crops (+0.012 on the 58, level on the holdout), and better labels. Even the soft labels score only 0.74–0.82 against the radiologists.
 - Retrain the side classifier on its own (cleaner) labels, and the ROI U-Net on the round-3 labels (round 4).
 - The 4 findings without an ROI (synovitis 0.79 and fracture 0.88 are the weakest) need their own approach.
 - Train on the mean of the Claude and Codex labels: on the 52 radiologist studies it beats either set alone (0.921 vs 0.907 / 0.909).

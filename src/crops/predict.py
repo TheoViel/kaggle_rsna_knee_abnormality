@@ -28,7 +28,7 @@ RUNS_DIR = "../logs/crops_run/2026-10-09/"
 
 @torch.no_grad()
 def predict_run(run, device):
-    from crops.train import GROUPS, CropDataset, Crop25D, load_crops
+    from crops.train import GROUPS, CropDataset, build_model, load_crops
 
     d = os.path.join(RUNS_DIR, run)
     a = json.load(open(os.path.join(d, "args.json")))
@@ -38,9 +38,7 @@ def predict_run(run, device):
     dummy = {c: pd.Series(0.0, index=info.StudyInstanceUID.unique()) for c in classes}
     ds = CropDataset(crops, info, classes, dummy)
     sd = torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu")
-    model = Crop25D(a["backbone"], len(classes), pretrained=False, img_size=a.get("img_size") or None,
-                    hidden=a.get("hidden", 256), dropout=a.get("dropout", 0.2), drop_path=0.0,
-                    head=a.get("head", "lstm"))
+    model = build_model(a, len(classes))
     # Runs from before axial crops existed have a 2-plane embedding (sagittal, coronal).
     n_planes = sd["plane_embed.weight"].shape[0]
     if n_planes != model.plane_embed.num_embeddings:

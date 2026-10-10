@@ -112,7 +112,7 @@ def predict_model(weights, crops, info, have, device="cuda"):
     """Study x finding probabilities of one crop model."""
     from torch.utils.data import DataLoader
 
-    from crops.train import GROUPS, CropDataset, Crop25D
+    from crops.train import GROUPS, CropDataset, build_model
     from infer.utils import amp_dtype
 
     a = json.load(open(os.path.join(weights, "args.json")))
@@ -124,8 +124,7 @@ def predict_model(weights, crops, info, have, device="cuda"):
     keep = have[ds.items.row.to_numpy(), ds.items.roi.to_numpy()]
     ds.items = ds.items[keep].reset_index(drop=True)
     sd = torch.load(os.path.join(weights, "ckpt_final.pt"), map_location="cpu")
-    model = Crop25D(a["backbone"], len(classes), pretrained=False, img_size=a.get("img_size") or None,
-                    hidden=a.get("hidden", 256), dropout=0.0, drop_path=0.0, head=a.get("head", "lstm"))
+    model = build_model(a, len(classes))
     n_planes = sd["plane_embed.weight"].shape[0]
     if n_planes != model.plane_embed.num_embeddings:
         model.plane_embed = nn.Embedding(n_planes, model.plane_embed.embedding_dim)

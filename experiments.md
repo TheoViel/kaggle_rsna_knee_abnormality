@@ -309,6 +309,363 @@ Mean AUC over the 8 ROI findings on the 58 radiologist studies. ★ marks the ho
 - **Stride 2 is the only clear loss** (0.929): 8 frames spread over ~16 slices take in too much outside the ROI.
 - **Frame count matters less than sampling.** Uniform 8 and 16 frames and resize 12 sit within noise of the reference. Resize 16 is up on the 58 (0.944) but level on the holdout.
 
+### 8b. Stride 1, 8 frames on every submission model
+
+The round-2 runs behind the submission recipe, retrained on stride-1 8-frame crops, everything else unchanged. Axial crops for the MCL and the axial OA model use the same sampling. AUC on the 58 radiologist studies:
+
+| Model (12 → 8 frames) | Finding | 12 frames | 8 frames |
+|---|---|---|---|
+| acl `56` → `79` | ACL | 0.969 | **0.973** |
+| mcl `57` → `80` | MCL | 0.991 | **1.000** |
+| menisci `58` → `81` | Medial Meniscus | 0.969 | **0.977** |
+| | Lateral Meniscus | 0.892 | **0.913** |
+| all `59` → `75` | 8 findings, mean | 0.937 | **0.946** |
+| oa 224 `60` → `82` | Medial OA | **0.981** | 0.975 |
+| | Lateral OA | **0.872** | 0.868 |
+| | PF OA | 0.889 | **0.894** |
+| oa + axial `61` → `83` | Medial OA | 0.967 | **0.972** |
+| | Lateral OA | 0.834 | **0.863** |
+| | PF OA | 0.896 | **0.906** |
+| bakers `62` → `84` | Baker's | 0.984 | **0.989** |
+
+Submission recipe (C except PF OA and Lateral OA, rank average), same model slots:
+
+| | ACL | MCL | Medial Meniscus | Lateral Meniscus | Medial OA | Lateral OA | PF OA | Baker's | Mean |
+|---|---|---|---|---|---|---|---|---|---|
+| 12 frames (56–62) | 0.972 | 0.994 | 0.975 | 0.921 | **0.974** | **0.872** | 0.896 | 0.986 | 0.949 |
+| 8 frames (79–84, 75) | **0.973** | **0.996** | **0.978** | **0.938** | **0.974** | 0.869 | **0.906** | **0.991** | **0.953** |
+
+- **Wins:** 8 frames scores higher on 17 of 19 model × finding pairs (mean +0.008), and on the recipe (+0.004).
+- **Holdout:** flat (mean −0.001), so the 8-frame models are at least as good there.
+- **Speed:** 8 frames is a third fewer frames per crop than 12, so the crop models run about 33% faster at inference.
+
+## 9. Slice aggregation
+
+How the 8 slices of a crop are combined. All runs use run 75's setup: `all` group, ConvNeXt-tiny, stride-1 8-frame crops, PL round-2 labels. GFLOP is per crop.
+
+- **Late fusion** (the default) runs each slice, with its two neighbours as RGB, through the 2D encoder on its own, then combines the slice vectors.
+- **Temporal shift** moves 1/8 of the channels from the previous slice and 1/8 from the next, before the depthwise conv of every block in the last two stages. Slices exchange information inside the encoder at no FLOP cost, for ~25% more latency from the memory shuffles.
+- **map3d** keeps the last feature maps of all slices as a (C, D, h, w) volume, applies two residual 3×3×3 convs, then pools. Space is not pooled before the slices are combined.
+- **Early fusion** stacks the 8 slices as the input channels of a single 2D image.
+
+AUC on the 58 radiologist studies. ★ marks the holdout pick.
+
+| Variant | Run | GFLOP | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | Mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| LSTM + attention pooling (reference) ★ | `09/75` | 23.3 | 0.973 | **0.984** | 0.976 | 0.935 | 0.969 | 0.859 | 0.880 | **0.993** | 0.946 |
+| attention pooling only | `09/92` | 23.3 | 0.974 | 0.977 | 0.972 | 0.907 | 0.971 | 0.845 | 0.876 | 0.989 | 0.939 |
+| transformer (2 layers) | `09/93` | 23.3 | 0.968 | 0.973 | 0.972 | **0.942** | 0.974 | 0.872 | **0.892** | 0.986 | **0.947** |
+| map3d: 3D convs on the last feature maps | `09/94` | 24.2 | **0.990** | 0.977 | 0.981 | 0.906 | 0.977 | **0.874** | 0.870 | 0.989 | 0.946 |
+| temporal shift + LSTM | `09/95` | 23.3 | 0.968 | 0.982 | 0.972 | 0.927 | 0.972 | 0.853 | 0.874 | 0.989 | 0.942 |
+| temporal shift + map3d | `09/96` | 24.2 | 0.985 | 0.977 | **0.988** | 0.893 | 0.971 | 0.863 | 0.879 | 0.991 | 0.943 |
+| early fusion (8 slices as channels) | `09/97` | 2.9 | 0.980 | 0.959 | 0.964 | 0.887 | **0.978** | 0.861 | 0.861 | 0.982 | 0.934 |
+
+- **No aggregation beats the BiLSTM.** The transformer (0.947), map3d (0.946) and temporal shift (0.942) are within the ~0.002–0.005 seed noise, both on the 58 and on the holdout.
+- **Mixing slices earlier does not help here.** The 2.5D input (neighbour slices as RGB) and 8 adjacent slices already carry the local 3D context.
+- **Early fusion is 8× cheaper but costs 0.012** on the 58 (−0.014 on the holdout).
+- **Ensembles:** LSTM + transformer + map3d reach 0.949 as a rank average, within noise of the single LSTM model.
+
+## 10. Backbones
+
+Same setup (run 75, LSTM head). Small ImageNet backbones from timm, chosen from current small-model comparisons and common Kaggle medical-imaging choices. The ConvNeXt family uses lr_backbone 1e-4; the mobile CNNs (EfficientNet, MobileNetV4, HGNet, RegNet, ResNet) use 3e-4 and EdgeNeXt 2e-4. EfficientViT-B1 could not run (no drop-path support in timm). Params are the encoder's; GFLOP is per 8-frame 128 px crop.
+
+| Variant | Run | params | GFLOP | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | Mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| convnext_tiny.fb_in22k (reference) | `09/75` | 27.8M | 23.3 | 0.973 | 0.984 | 0.976 | 0.935 | 0.969 | 0.859 | 0.880 | 0.993 | 0.946 |
+| caformer_s18.sail_in22k_ft_in1k | `10/5` | 23.2M | 20.6 | 0.977 | **0.991** | 0.966 | **0.937** | **0.974** | 0.868 | 0.887 | 0.991 | **0.949** |
+| hgnetv2_b2.ssld_stage2_ft_in1k | `10/6` | 9.2M | 6.0 | 0.987 | 0.984 | 0.977 | 0.918 | 0.967 | 0.839 | **0.900** | 0.993 | 0.946 |
+| convnext_nano.in12k_ft_in1k | `09/98` | 15.0M | 12.8 | **0.990** | 0.982 | 0.970 | 0.925 | 0.966 | 0.845 | 0.876 | 0.991 | 0.943 |
+| edgenext_small.usi_in1k | `10/4` | 5.3M | 5.0 | 0.972 | 0.982 | 0.988 | 0.911 | 0.964 | 0.857 | 0.866 | **0.995** | 0.942 |
+| resnet34d.ra2_in1k | `10/7` | 21.3M | 20.4 | 0.978 | 0.982 | 0.980 | 0.909 | 0.971 | 0.832 | 0.884 | 0.991 | 0.941 |
+| tf_efficientnetv2_b3.in21k_ft_in1k ★ | `10/0` | 12.8M | 8.4 | 0.982 | 0.982 | 0.971 | 0.897 | 0.971 | 0.849 | 0.885 | 0.989 | 0.941 |
+| convnextv2_nano.fcmae_ft_in22k_in1k | `09/99` | 15.0M | 12.8 | 0.975 | 0.977 | 0.975 | 0.899 | 0.967 | **0.892** | 0.852 | 0.986 | 0.940 |
+| regnety_016.tv2_in1k | `10/8` | 10.3M | 8.4 | 0.979 | 0.971 | 0.982 | 0.912 | 0.972 | 0.845 | 0.866 | 0.989 | 0.940 |
+| mobilenetv4_conv_medium.e500_r256_in1k | `10/1` | 8.4M | 4.3 | 0.974 | 0.975 | **0.992** | 0.903 | 0.967 | 0.826 | 0.885 | 0.986 | 0.939 |
+| mobilenetv4_hybrid_medium.ix_e550_r256_in1k | `10/2` | 9.8M | 5.0 | 0.984 | 0.968 | 0.981 | 0.847 | 0.964 | 0.843 | 0.888 | 0.989 | 0.933 |
+| efficientnet_b3.ra2_in1k | `09/100` | 10.7M | 5.0 | 0.982 | 0.977 | 0.958 | 0.882 | 0.960 | 0.838 | 0.865 | 0.993 | 0.932 |
+
+- **ConvNeXt-tiny stays the reference.** Only CAFormer-S18 scores higher on the 58 (0.949), within noise and level on the holdout.
+- **HGNetV2-B2 is the efficient option:** 0.946 with a third of the parameters and a quarter of the FLOPs.
+- **The mobile CNNs trail by 0.005–0.015:** EfficientNet-B3, MobileNetV4 and RegNetY.
+- **Ensembles across backbones add little:** ConvNeXt-tiny + CAFormer 0.950, + HGNetV2 0.948, + ConvNeXt-nano 0.948.
+
+## 11. Effusion and synovitis: capsule crops
+
+Effusion and synovitis have no box of their own, but both sit inside the joint capsule. The eight ROIs (menisci, the three compartments, the ligaments, the patellofemoral joint, Baker's cyst) outline the capsule, so no new segmentation model is needed.
+
+**Capsule box.** Per sagittal or coronal series, the capsule box is the union of the 8 ROI boxes, widened in-plane by a fraction of its height and width on each side (`crops.prepare --capsule`).
+- The union already spans ~87% of the slices and ~2/3 of the image in-plane.
+- On effusion-positive studies, the bright suprapatellar fluid above the patella often reaches past the plain union on sagittal series, so expansion was the main thing to validate.
+- Superior-only extra expansion was tested too.
+
+**Crops.** One square crop per series around the box, 160 px, with uniform frames over the box's slices. The box covers most slices, so 8 strided frames as for the small ROIs would not cover the capsule.
+
+**Models.** One `capsule` group: effusion and synovitis share the crop and have separate finding embeddings. Trained on the Claude + Codex label mean (the pseudo-labels cover only the 8 ROI findings), sagittal + coronal series, 10 epochs.
+
+The 3D models use the same box, 32 slices interpolated over it at 128 px (the ROI U-Net's input size), and the U-Net's 6-stage residual encoder with average + max pooling. It starts either from the ROI U-Net weights, which were trained on these knee volumes, or from scratch.
+
+AUC on the 58 radiologist studies. ★ marks the holdout pick.
+
+| Run | Capsule box | Frames | Model | Train labels | Effusion | Synovitis | Mean |
+|---|---|---|---|---|---|---|---|
+| `10/10` | +0% | 16 | 2.5D ConvNeXt-tiny | mean | 0.976 | 0.824 | **0.900** |
+| `10/9` | +15% | 16 | 2.5D ConvNeXt-tiny | mean | 0.978 | 0.797 | 0.887 |
+| `10/11` | +30% | 16 | 2.5D ConvNeXt-tiny | mean | 0.969 | 0.783 | 0.876 |
+| `10/12` | +10%, +30% superior | 16 | 2.5D ConvNeXt-tiny | mean | 0.970 | 0.803 | 0.887 |
+| `10/13` | +15% | 8 | 2.5D ConvNeXt-tiny | mean | 0.978 | 0.804 | 0.891 |
+| `10/14` ★ | +15% | 24 | 2.5D ConvNeXt-tiny | mean | 0.980 | 0.784 | 0.882 |
+| `10/22` | +15% | 24 | 2.5D ConvNeXt-tiny, seed 1 | mean | 0.969 | 0.786 | 0.878 |
+| `10/25` | +15% (+ axial capsule boxes) | 24 | 2.5D ConvNeXt-tiny, sagittal + coronal + axial | mean | **0.985** | 0.796 | 0.890 |
+| `10/15` | +15% | 32 (3D) | 3D, ROI U-Net encoder (pretrained) | mean | 0.955 | 0.821 | 0.888 |
+| `10/16` | +15% | 32 (3D) | 3D, same encoder from scratch | mean | 0.940 | **0.845** | 0.893 |
+| `10/17` | +15% | 16 | 2.5D, map3d head | mean | 0.949 | 0.810 | 0.880 |
+| `10/18` | +15% | 16 | 2.5D, temporal shift | mean | 0.975 | 0.791 | 0.883 |
+| `10/19` | +15% | 16 | 2.5D, early fusion | mean | 0.924 | 0.806 | 0.865 |
+| `10/20` | +15% | 24 | 2.5D ConvNeXt-tiny | PL (capsule) | 0.975 | 0.772 | 0.873 |
+| `10/21` | +15% | 32 (3D) | 3D from scratch | PL (capsule) | 0.952 | 0.789 | 0.870 |
+
+References on the 58:
+
+| | Effusion | Synovitis |
+|---|---|---|
+| b1_c1 | 0.989 | 0.851 |
+| Baseline sequence classifier, 5-run ensemble | 0.959 | 0.791 |
+| Claude labels | 0.869 | 0.824 |
+| Codex labels (52 studies) | 0.920 | 0.742 |
+
+- **Effusion works well from the capsule crop:** 0.97–0.98. That is above our whole-series baseline (0.959) and above the labels it was trained on (0.869 / 0.920), but below b1_c1 (0.989).
+- **Synovitis stays hard:** 0.78–0.82 for the 2.5D models, around the baseline's 0.791, and below b1_c1's 0.851. With 27 positives among 58 studies, the spread between configurations is mostly noise. The two seeds of the selected configuration score 0.784 and 0.786.
+- **Expansion:** +15% or more is needed on the holdout (+0%: 0.935, +15%: 0.940, +30%: 0.940, superior +30%: 0.941). On the 58 the tight box scores best on synovitis (0.824), which is consistent with noise. +15% is kept: it contains the suprapatellar recess and is best on effusion.
+- **Frames:** more frames help a little now that the ROI is large. On the holdout, 8 frames score 0.936, 16 score 0.940 and 24 score 0.944.
+- **3D models are not better here.** The 3D encoder is level or better on synovitis on the 58 (0.82–0.85) but worse on effusion (0.94–0.955) and clearly worse on the holdout (0.917).
+  - Pretraining on the ROI task does not help: the pretrained and from-scratch encoders score the same.
+  - Rank-averaging 2.5D + 3D lifts synovitis on the 58 (0.83) but lowers the holdout (0.937 vs 0.943), so it is not selected.
+- **Aggregation:** as for the ROIs, the LSTM is as good as anything else. The temporal shift ties, while map3d and early fusion lose.
+- **Axial series:** capsule boxes on axial series come from the union of the registered axial ROI boxes. Adding them scores 0.890 on the 58 (effusion 0.985, synovitis 0.796), vs 0.882 without, but 0.941 on the holdout vs 0.944. That is within seed noise, so it is not selected. It is the first option to retry, since axial series show the suprapatellar and patellar recesses well.
+- **Pseudo-labels don't help here** (0.874 vs 0.882). The teacher mean agrees better with the radiologists than the label mean (effusion 0.973 vs 0.916), but the student trained on it does not improve.
+- **Selected:** run `10/14`, +15%, 24 frames, 2.5D ConvNeXt-tiny, label mean. The submission uses fullfit versions of both seeds, rank-averaged.
+  - Through the inference pipeline with the non-fullfit seeds: effusion 0.975, synovitis 0.786.
+  - The 12-finding macro rises from 0.799 to **0.865**, with contusion and fracture still at 0.5.
+
+## 12. Contusion and fracture from the joint crop
+
+Bone bruises and fractures around the knee also lie inside the capsule box, which covers the femoral condyles, tibial plateau and patella. The same crop (+15%, 24 frames, 160 px, 2.5D ConvNeXt-tiny, Claude + Codex label mean) was trained on all four non-ROI findings at once (`joint4` group), with and without axial capsule crops.
+
+| Run | Planes | Effusion | Synovitis | Contusion | Fracture |
+|---|---|---|---|---|---|
+| `10/14` (capsule: effusion + synovitis only, §11 ★) | sag + cor | 0.980 | 0.784 | – | – |
+| `10/26` joint4 | sag + cor | 0.976 | **0.804** | 0.931 | 0.936 |
+| `10/27` joint4 ★ | sag + cor + axial | **0.991** | 0.781 | **0.942** | **0.946** |
+| b1_c1 | | 0.989 | 0.851 | 0.955 | 0.953 |
+
+- **Contusion and fracture read well from the joint crop:** 0.94–0.95, close to b1_c1. The axial version (★ on the holdout: contusion 0.960, fracture 0.953) is better on both findings, on the 58 and on the holdout.
+- **Sharing hurts synovitis on the holdout:** 0.930 in the shared model vs 0.946 for the capsule-only model. Effusion and synovitis therefore stay with the §11 capsule models, and contusion and fracture come from `10/27`.
+
+**All 12 findings, pure ROI models**, through the inference pipeline on the 58 (non-fullfit models):
+- 8 ROI findings: 8-frame recipe.
+- Effusion and synovitis: capsule seeds `10/14` + `10/22`.
+- Contusion and fracture: `10/27`.
+
+| | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Effusion | Synovitis | Baker's | Contusion | Fracture | **Macro (12)** |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| b1_c1 | **0.977** | 0.964 | 0.966 | 0.865 | **0.986** | **0.876** | 0.870 | **0.989** | **0.851** | 0.976 | **0.955** | **0.953** | 0.936 |
+| **Pure ROI** | 0.972 | **0.994** | **0.977** | **0.934** | 0.974 | 0.868 | **0.905** | 0.975 | 0.786 | **0.991** | 0.942 | 0.947 | **0.939** |
+
+## 13. Study-level models: learned aggregation over series
+
+The series-level models are scored per study by averaging their series' probabilities (§ series → study analysis: max, top-k, plane / sequence / box-confidence weighting, all within noise of the mean). Here the averaging is replaced by a learned layer, trained end to end (`main_study.py`, `crops/study.py`):
+
+- **What a sample is:** one study, with every (series, ROI) crop of the group's findings. The crop encoder is the series model: 2.5D ConvNeXt + BiLSTM over slices, which gives one vector per crop.
+- **The set to aggregate:** for each (study, finding), the vectors of that study's series. The number of series varies, so the set is padded and masked.
+- **Aggregators:**
+  - mean pooling (the control);
+  - gated attention pooling (MIL), which starts as the mean;
+  - 2 transformer layers, then attention pooling;
+  - log-sum-exp pooling of the per-series logits, with a learned temperature between mean and max.
+- **Training:**
+  - initialised from the series-level run, 4 epochs;
+  - learning rates: encoder 2e-5, series head 1e-4, aggregator 5e-4;
+  - each series dropped with probability 0.25 (at least one kept);
+  - at most 8 series per study;
+  - the series run's labels.
+- **Validation:** every series kept, one prediction per (study, finding).
+
+AUC on the 58; holdout = mean over the findings; ★ = holdout pick.
+
+**`all` model (8 ROI findings), from `09/75`**
+
+| Aggregation | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | Mean (58) | Holdout |
+|---|---|---|---|---|---|---|---|---|---|---|
+| series level (`09/75`, mean of series probabilities) | **0.973** | **0.984** | **0.976** | 0.935 | 0.969 | **0.859** | 0.880 | **0.993** | 0.946 | 0.942 |
+| study, mean pooling | **0.973** | **0.984** | 0.964 | 0.939 | 0.974 | 0.850 | 0.889 | **0.993** | 0.946 | 0.943 |
+| study, gated attention | **0.973** | **0.984** | 0.973 | **0.945** | 0.972 | 0.856 | **0.891** | 0.984 | **0.947** | 0.943 |
+| study, gated attention, no series dropout | **0.973** | **0.984** | 0.969 | 0.940 | 0.971 | 0.853 | 0.889 | 0.986 | 0.946 | 0.944 |
+| study, transformer + attention ★ | **0.973** | **0.984** | 0.966 | 0.929 | 0.972 | **0.859** | 0.889 | 0.986 | 0.945 | 0.944 |
+| study, LSE (learned r = 0.37) | **0.973** | **0.984** | 0.970 | 0.939 | **0.975** | 0.845 | 0.891 | 0.991 | 0.946 | 0.943 |
+
+**Capsule model (effusion, synovitis), from `10/14`**
+
+| Aggregation | Effusion | Synovitis | Mean (58) | Holdout |
+|---|---|---|---|---|
+| series level (`10/14`) | **0.980** | **0.784** | **0.882** | 0.943 |
+| study, mean pooling | 0.978 | 0.782 | 0.880 | 0.944 |
+| study, gated attention | 0.979 | 0.780 | 0.880 | 0.944 |
+| study, transformer + attention | 0.975 | 0.766 | 0.870 | 0.944 |
+| study, LSE ★ | 0.974 | 0.781 | 0.878 | 0.944 |
+
+**Joint model with axial (4 non-ROI findings), from `10/27`**
+
+| Aggregation | Effusion | Synovitis | Contusion | Fracture | Mean (58) | Holdout |
+|---|---|---|---|---|---|---|
+| series level (`10/27`) | 0.991 | 0.781 | 0.942 | **0.946** | **0.915** | 0.947 |
+| study, mean pooling ★ | **0.996** | 0.774 | **0.943** | 0.942 | 0.914 | 0.949 |
+| study, gated attention | **0.996** | **0.787** | 0.931 | 0.939 | 0.913 | 0.947 |
+| study, transformer + attention | 0.990 | 0.779 | 0.937 | 0.935 | 0.910 | 0.947 |
+
+- **No learned aggregation beats averaging.**
+  - Every variant lands within ±0.002 (`all`), ±0.012 (capsule) and ±0.005 (joint) of the series-level model on the 58.
+  - On the holdout they score 0.943–0.949, against 0.942–0.947 at series level.
+  - The mean-pooling control scores the same, so the 4 extra epochs at study level explain the small holdout drift, not the aggregation.
+- **The aggregators learn to average.**
+  - The attention weights stay almost uniform: the largest series weight in a study is typically only 1.04–1.19 × the uniform weight (90th percentile 1.17–1.58).
+  - The only plane preference is a mild upweighting of axial series in the joint model (×1.12–1.31).
+  - LSE settles at r = 0.37, close to a mean of logits; it does not move towards the max.
+- **Why:** the series models are trained with the *study* label on every series. Each series therefore already learns to predict the study's label from its own view, as far as that view allows, including "not visible here, but likely given the rest". There is little left for a set-level layer to fix. Anomalies visible on one view only exist, but they are not frequent or consistent enough in these labels to teach a re-weighting.
+- **Not adopted.** The series-level models with averaging stay. To make the aggregation matter, series-level training would need series-level labels (which view shows the finding), which we don't have.
+
+## 14. Medial and lateral OA: what was wrong
+
+**Symptom.** On the 58, medial OA scored 0.974 and lateral OA 0.868, against b1_c1's 0.986 and 0.876. Almost all errors are false positives. Lateral OA is ranked high in studies with medial OA but no lateral OA, and vice versa:
+
+| | MOA–LOA correlation |
+|---|---|
+| Radiologist labels (58) | 0.32 |
+| Claude training labels | 0.44 |
+| Our predictions (ranks) | 0.84 |
+| b1_c1 predictions (ranks) | 0.81 |
+
+Within studies without medial OA, lateral OA scores only 0.826. Both models score "how arthritic is the knee" more than "which compartment".
+
+**Cause 1: the ROI crop crosses into the other compartment.**
+- On coronal (and axial) series, left–right runs along the image columns.
+- The crop is a square of 1.5 × the box's larger side, centred on the box.
+- Lateral OA boxes are wide (0.36–0.39 of the image, vs 0.27–0.29 for medial), so the lateral crop is about half the image wide and reaches past the intercondylar notch into the medial compartment.
+- The boxes themselves rarely overlap the other side: only 2% of coronal lateral-OA boxes overlap the medial meniscus box by more than 20%. It's the crop that crosses over.
+- Sagittal crops are not affected: there left–right is the slice axis, and 8 strided slices stay within the box.
+
+**Cause 2: the labels.** The training labels are correlated, and the pseudo-labels amplify it (MOA–LOA correlation: Claude 0.44, Claude + Codex mean 0.47, PL round 2 0.54, PL round 1 0.60).
+
+**Fixes tried** in the OA-only model (`oa` group, ConvNeXt-tiny 128 px, sagittal + coronal, 8 strided frames, PL round 2 unless stated):
+- **Midline crop** (`crops.prepare --oa_midline slide|clip`). The intercondylar midline is placed halfway between the medial and lateral menisci boxes' inner edges. Each medial / lateral OA crop window on coronal and axial series is shifted outward so it never crosses it, keeping its size and gaining periphery, where osteophytes are. `clip` also cuts the box at the midline.
+- **Compartment box** (`--compartment f`): the OA box joined with the same side's meniscus box, extended by f × its height up and down into the femoral condyle and the tibial plateau.
+- **Context and sampling:** wider margins, and 12 uniform frames over the box.
+- **Labels:** Claude only, and the Claude + Codex mean.
+- **Cross-compartment model** (`main_cross.py`): a transformer across the three compartment crops of a series, so the model can see which compartment is worse.
+
+AUC on the 58:
+
+| Crop / labels | Run | Medial OA | Lateral OA | PF OA | Holdout (3 OA) |
+|---|---|---|---|---|---|
+| Reference crop (8 strided frames, 25% margin) | `10/29` | 0.972 | 0.870 | 0.893 | 0.926 |
+| 12 uniform frames | `10/30` | 0.972 | 0.853 | 0.876 | 0.925 |
+| margin 0.5 | `10/31` | 0.980 | 0.849 | 0.874 | 0.923 |
+| margin 0.75 | `10/32` | **0.984** | 0.855 | 0.867 | 0.915 |
+| compartment box +30% (femur / tibia) | `10/33` | **0.984** | 0.865 | 0.888 | 0.923 |
+| compartment box +50% | `10/34` | 0.980 | 0.843 | 0.896 | 0.921 |
+| Claude labels (not PL) | `10/35` | 0.969 | 0.851 | 0.900 | 0.929 |
+| Claude + Codex mean labels | `10/36` | 0.969 | 0.870 | 0.891 | 0.928 |
+| **midline crop (slide)** | `10/37` | 0.971 | **0.884** | 0.889 | 0.927 |
+| midline crop (clip box) | `10/38` | 0.972 | 0.880 | 0.893 | 0.927 |
+| midline crop (slide), seed 1 | `10/39` | 0.977 | 0.870 | 0.894 | 0.926 |
+| **compartment +30% + midline** | `10/40` | 0.978 | 0.882 | 0.889 | 0.928 |
+| margin 0.5 + midline | `10/41` | 0.977 | 0.878 | 0.883 | 0.925 |
+| compartment +30% + midline, 224 px | `10/42` | **0.984** | 0.870 | 0.893 | 0.928 |
+| midline + axial (midline) crops | `10/43` | 0.974 | 0.874 | **0.903** | 0.927 |
+| b1_c1 | | 0.986 | 0.876 | 0.870 | |
+
+- **Wider crops help medial OA and hurt lateral OA** (margin 0.75: 0.985 / 0.855). That is the cross-over effect: a wider lateral crop sees more of the medial compartment.
+- **The midline crop helps lateral OA:** 0.884 and 0.870 over two seeds, against 0.870 for the reference. Its prediction correlation drops a little (0.83 → 0.79–0.80).
+- **Compartment box + midline** is the best all-round crop: 0.978 / 0.882 / 0.889, and the best holdout among the 128 px runs. At 224 px it reaches 0.985 on medial OA but drops lateral OA to 0.870.
+- **Labels without PL** do not fix the cross-talk (Claude labels: lateral OA 0.851).
+- **The cross-compartment model** does not help (0.978 / 0.855 / 0.893).
+- **Holdout caveat:** for lateral OA the holdout scores against Claude's labels, so it favours Claude-trained models (holdout 0.914 for a model that scores 0.851 on the 58). It is a weak selection rule for this finding.
+
+**Post-hoc cross-talk correction.** Lateral OA score = rank(lateral OA) − β × rank(medial OA), with β chosen on the holdout.
+- On the 7 midline-crop runs averaged, the holdout picks β = 0.4 (lateral OA holdout 0.907 → 0.923).
+- On the 58 it raises lateral OA from 0.876 to **0.899**.
+- The same correction does not help medial OA, which is the dominant compartment.
+
+**Ensembles** (rank average per finding, AUC on the 58):
+
+| | Medial OA | Lateral OA | PF OA | MOA + LOA |
+|---|---|---|---|---|
+| Current submission recipe | 0.974 | 0.868 | **0.906** | 0.921 |
+| 7 midline-crop runs, averaged | 0.980 | 0.876 | 0.896 | 0.928 |
+| Greedy selection on the holdout | 0.978 | 0.870 | 0.903 | 0.924 |
+| **7 midline-crop runs + lateral OA correction (β = 0.4)** | 0.980 | **0.899** | 0.896 | **0.940** |
+| b1_c1 | **0.986** | 0.876 | 0.870 | 0.931 |
+
+Lateral OA now beats b1_c1. Medial OA is 0.006 short, about 4 misordered positive/negative pairs out of 645. More 224 px seeds are training.
+
+## 15. ACL
+
+ACL scored 0.972 on the 58 (b1_c1: 0.977) with 24 positives and 34 negatives (816 positive/negative pairs).
+
+**The ACL crop.**
+- On sagittal series the U-Net's "ACL" box mostly covers the posterior tibial plateau, not the ligament. The box was learned from attention maps that favoured the classic pivot-shift bone bruise there.
+- Coronal-only crops (0.979) beat sagittal-only ones (0.967) in the series-level predictions.
+- To test whether the ligament was being cropped out, an anatomical **notch box** was built from the two meniscus boxes (`crops.prepare --acl_notch`):
+  - sagittal: the slices between the menisci;
+  - coronal: the columns between their inner edges;
+  - vertically: from half a meniscus height above the joint line, the notch roof, to a quarter below, the tibial spines.
+  - Its crops show the notch and the ligament.
+
+**Sweep** (ACL-only model, PL round 2, one change at a time). The holdout is saturated for ACL (0.98–0.995 for every variant) and cannot rank them, so the 58 is the main signal here. Selecting on it is optimistic.
+
+| Variant | Run | ACL (58) | Holdout |
+|---|---|---|---|
+| Reference: ConvNeXt 128, sag + cor, 8 strided frames (`09/79`) | `09/79` | 0.973 | 0.992 |
+| reference, seed 1 | `10/57` | 0.974 | 0.992 |
+| reference, seed 2 | `10/58` | 0.972 | 0.993 |
+| margin 0.5 | `10/59` | 0.972 | 0.993 |
+| margin 0.75 | `10/60` | 0.960 | 0.993 |
+| 12 strided frames | `10/61` | 0.974 | 0.993 |
+| 16 strided frames | `10/62` | 0.974 | 0.993 |
+| sagittal only | `10/63` | 0.967 | 0.992 |
+| coronal only | `10/64` | 0.973 | 0.981 |
+| **+ axial crops** | `10/65` | **0.989** | 0.993 |
+| + axial crops, seed 1 | `10/76` | 0.983 | 0.992 |
+| whole-joint capsule crop | `10/66` | 0.977 | 0.994 |
+| ACL ∪ lateral compartment crop (192 px) | `10/72` | 0.967 | 0.993 |
+| notch crop | `10/73` | 0.969 | 0.994 |
+| notch crop, seed 1 | `10/75` | 0.967 | 0.993 |
+| notch ∪ U-Net ACL box | `10/74` | 0.968 | 0.995 |
+| **CAFormer-S18** | `10/67` | **0.989** | 0.993 |
+| **HGNetV2-B2** | `10/68` | 0.984 | 0.994 |
+| ConvNeXt 224 px | `10/69` | 0.975 | 0.993 |
+| **transformer head** | `10/70` | 0.987 | 0.993 |
+| **map3d head** | `10/71` | 0.987 | 0.993 |
+| CAFormer + axial | `10/77` | 0.987 | 0.994 |
+| transformer head + axial | `10/78` | **0.989** | 0.993 |
+| HGNetV2 + axial | `10/79` | **0.989** | 0.993 |
+| CAFormer + transformer + axial | `10/80` | 0.984 | 0.993 |
+
+- **The notch crop does not help** (0.967–0.969), nor does joining it with the old box. The bruise-site crop carries much of the signal: secondary signs matter, and the zoomed-out notch crop loses detail on the ligament itself.
+- **Wider context does not help** either: margin 0.75 scores 0.960, and the lateral-compartment union 0.967.
+- **What helps:** axial crops (0.983–0.989 over 2 seeds), CAFormer-S18 (0.989), a transformer or map3d head over the slices (0.987), and HGNetV2-B2 (0.984). Combining these factors in one model does not add up: 0.984–0.989.
+- **The `all` model drags ACL down** in the recipe: axial alone scores 0.989, and adding `all` brings it to 0.979.
+
+**Ensembles** (rank average):
+
+| ACL ensemble | 58 | Holdout |
+|---|---|---|
+| Current recipe (`09/79` + `all` `09/75`) | 0.975 | 0.992 |
+| All 6 axial runs | 0.988 | 0.993 |
+| **4 distinct axial models: ConvNeXt `10/65`, CAFormer `10/77`, ConvNeXt + transformer head `10/78`, HGNetV2 `10/79`** | **0.993** | **0.994** |
+| b1_c1 | 0.977 | |
+
+The ACL recipe is now the 4 distinct axial models, one per architecture (the same "one run per idea" rule as for OA), without the `all` model.
+
 ## Next steps
 
 - ROIs and crop models for the 4 remaining findings: capsule / joint recesses for effusion and synovitis, bone for contusion and fracture.
