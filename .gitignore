@@ -8,6 +8,8 @@ __pycache__/
 .vscode/
 .claude/
 .env
+.nda-venv/
+.redivis-venv/
 
 # Local data and benchmark artifacts
 datasets/

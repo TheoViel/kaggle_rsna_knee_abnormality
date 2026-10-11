@@ -20,6 +20,8 @@ Heads:
               logit per ROI token;
       xattn   cross-attention pooling of the bottleneck, `queries` learned
               queries per finding (2nd place), one logit per finding;
+  - anatomy (aux, `n_anat`): per decoder stage, a 1x1 conv to the 9 nnU-Net knee
+    structures (bones, cartilage, menisci; sigmoid channels, partial labels);
   - meta (aux): fluid-sensitive and fat-suppressed flags from the global token.
 """
 
@@ -73,7 +75,7 @@ class CrossAttnPool(nn.Module):
 
 class MT3D(nn.Module):
     def __init__(self, n_dec=3, head="masked", dim=256, tf_layers=2, dropout=0.2, queries=4, pretrained=True,
-                 n_cls=len(ROI_CLASSES), detach_masks=False):
+                 n_cls=len(ROI_CLASSES), detach_masks=False, n_anat=0):
         super().__init__()
         from roi.train import build_model as build_unet
 
@@ -86,6 +88,9 @@ class MT3D(nn.Module):
         self.transpconvs = dec.transpconvs[:n_dec]
         self.stages = dec.stages[:n_dec]
         self.seg_layers = dec.seg_layers[:n_dec]
+        # Second segmentation head (anatomy, `mt3d.anatomy`): one 1x1 conv per decoder stage.
+        self.anat_layers = nn.ModuleList(
+            [nn.Conv3d(self.encoder.output_channels[-(s + 2)], n_anat, 1) for s in range(n_dec)]) if n_anat else None
         ch = self.encoder.output_channels                            # 32 64 128 256 320 320
         dec_ch = [ch[-(s + 2)] for s in range(n_dec)]               # 320 256 128 ...
         bott = ch[-1]
@@ -106,17 +111,20 @@ class MT3D(nn.Module):
             self.xattn = CrossAttnPool(bott, n_cls, queries)
         self.meta = nn.Linear(dim, 2)
 
-    def forward(self, x, plane):
-        """x (B, 1, D, S, S) in [0, 1] -> dict(cls (B, K), seg [per stage (B, 8, d, h, w)], meta (B, 2))."""
+    def forward(self, x, plane, boxes=None):
+        """x (B, 1, D, S, S) in [0, 1] -> dict(cls (B, K), seg [per stage (B, 8, d, h, w)], meta (B, 2)).
+        `boxes` is unused (pooling under given boxes: `mt3d.hybrid`)."""
         skips = self.encoder(x)
         bott = skips[-1]
         g = self.glob(torch.cat([bott.mean((2, 3, 4)), bott.amax((2, 3, 4))], 1)) + self.plane_embed(plane)
-        lres, segs, pooled = bott, [], []
+        lres, segs, pooled, anat = bott, [], [], []
         for s in range(self.n_dec):
             h = self.transpconvs[s](lres)
             h = self.stages[s](torch.cat((h, skips[-(s + 2)]), 1))
             seg = self.seg_layers[s](h)
             segs.append(seg)
+            if self.anat_layers is not None:
+                anat.append(self.anat_layers[s](h))
             if self.head == "masked":
                 w = torch.sigmoid(seg.float())
                 if self.detach_masks:
@@ -125,7 +133,7 @@ class MT3D(nn.Module):
                 num = torch.einsum("bkn,bcn->bkc", w.flatten(2), h.float().flatten(2))
                 pooled.append(num / (w.flatten(2).sum(-1, keepdim=True) + 1e-3))
             lres = h
-        out = {"seg": segs, "meta": self.meta(g)}
+        out = {"seg": segs, "anat": anat, "meta": self.meta(g)}
         if self.head == "masked":
             t = self.tok(torch.cat(pooled, -1)) + self.roi_embed[None] + self.plane_embed(plane)[:, None]
             t = torch.cat([g[:, None], t], 1)

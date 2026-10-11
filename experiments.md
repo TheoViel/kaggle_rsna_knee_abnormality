@@ -666,6 +666,123 @@ ACL scored 0.972 on the 58 (b1_c1: 0.977) with 24 positives and 34 negatives (81
 
 The ACL recipe is now the 4 distinct axial models, one per architecture (the same "one run per idea" rule as for OA), without the `all` model.
 
+## 16. External data: OAI (Osteoarthritis Initiative)
+
+**Data.** OAI baseline MRI (NDA package 1250166) for the 2,400 knees (2,030 participants) with a baseline MOAKS reading (`kMRI_SQ_MOAKS_BICL00`).
+- **Series:** 5 per knee, 12,053 in total (132 GB): sagittal IW-TSE with fat suppression, coronal IW-TSE, sagittal 3D DESS, and coronal and axial DESS reformats.
+- **Scanner:** 3 T Siemens only, research protocol. Our data is mixed 1.5/3 T clinical.
+
+**Labels** (`src/oai/labels.py`), from MOAKS:
+- **Compartment OA**, with a Hunter-2011-style definition that leans on cartilage, because osteophytes are scored for only ~20% of knees:
+  - 1: full-thickness loss on a lesion covering ≥ 10% of a subregion, or an osteophyte of grade ≥ 2, or a ≥ 10% lesion with a large bone marrow lesion or maceration;
+  - 0.5: borderline;
+  - 0 otherwise.
+- **Meniscal tear:** any tear or maceration, or a root tear.
+- **ACL:** complete tear 1, partial 0.5.
+- **Effusion and Hoffa synovitis:** grade ≥ 2 → 1, mild → 0.25.
+- **Baker's:** popliteal cyst.
+- **No counterpart:** MCL, contusion, fracture.
+- **Prevalence:** medial / lateral / PF OA 0.34 / 0.26 / 0.55 (Claude on our data: 0.23 / 0.14 / 0.27); medial / lateral meniscus 0.41 / 0.20; effusion 0.29; synovitis 0.23; ACL 0.06.
+
+**Pipeline** (`src/oai/prep.py`, `src/oai/boxes.py`): the test-time path, run straight from the series archives.
+- **Thin 3D series** (DESS 0.7 mm, reformats 1.5 mm) are averaged into ~3 mm slabs, so that 8-slice crops cover the same anatomy as on clinical series.
+- **Side classifier:** agrees with the known knee side on 98–100% of the OAI series.
+- **ROI U-Net:** mean box confidence 0.968 on every sequence, DESS included; 2 weak boxes out of 77,208.
+
+**Strategies tried** (each against the same model without OAI; AUC on the 58 / holdout):
+
+| Strategy | Result |
+|---|---|
+| **Joint training** (our data + OAI crops, OAI labels), OA model | lateral OA 0.882 → 0.913 on the 58 for seed 0, but 0.865 for seed 1. The 4-model OA ensemble with OAI is level on the 58 (0.978 / 0.896 corrected) and lower on the holdout (−0.007 to −0.018). |
+| Joint training, TSE sequences only | worse than all sequences |
+| Joint training, OAI weight 0.5 / 2 | between / no better |
+| OAI only (transfer test) | medial OA 0.913, lateral 0.772, PF 0.829 on our 58, without any of our data. Medial–lateral prediction correlation **0.14** (ours: 0.84). |
+| OAI pretraining (same labels) → fine-tuning | 0.922 / 0.920 vs 0.917 / 0.928 |
+| OAI-only model as a teacher (0.25 mixed into PL round 2) | the labels improve on the 58 (lateral OA 0.845 → 0.876), the models trained on them do not |
+| Joint training, "all" model | PF OA +0.032 and medial meniscus +0.014 on the 58; MCL −0.009 on the holdout; holdout mean −0.002 |
+| Joint training, menisci (ConvNeXt), 2 seeds | lateral meniscus holdout +0.004 / +0.017, the 58 mixed; in the menisci recipe +0.002 on the holdout only |
+| Joint training: capsule (effusion, synovitis), ACL, Baker's | no gain (synovitis holdout −0.018) |
+| Joint training, OA with axial (the PF OA model) | **PF OA −0.014 on both**, also with PF labels removed or made stricter: the OAI axial (DESS reformat) crops are the problem, not the label |
+| **MOAKS multi-task pretraining → fine-tuning** | see below |
+
+**MOAKS multi-task pretraining.** The crop model is first trained on OAI alone, with 25 fine-grained MOAKS gradings as targets, each tied to its ROI crop:
+- per compartment: cartilage lesion size, full-thickness loss and extent, bone marrow lesions, osteophytes;
+- per meniscus: tear, maceration, signal, extrusion;
+- ACL grade and popliteal cyst.
+
+It is then fine-tuned on our data with the usual recipe (`main_crops.py --init`). This is the first strategy that helps on both the 58 and the holdout for OA, in two different models:
+
+| Model | Finding | ImageNet init | MOAKS-pretrained |
+|---|---|---|---|
+| OA (run 40 setup) | Medial OA | 0.978 / 0.947 | 0.984 / 0.947 |
+| | Lateral OA | 0.882 / 0.905 | 0.897 / 0.910 |
+| | PF OA | 0.889 / 0.931 | 0.915 / 0.931 |
+| All (run 75 setup) | Lateral OA | 0.859 / 0.898 | 0.880 / 0.904 |
+| | PF OA | 0.880 / 0.924 | 0.906 / 0.931 |
+| | MCL | 0.984 / 0.953 | 0.980 / 0.927 |
+| Menisci (ConvNeXt) | mean | 0.947 / 0.936 | 0.943 / 0.940 |
+
+- **A shorter, lower-learning-rate fine-tuning gains less.**
+- **MCL:** the first MOAKS-pretrained "all" seed dropped on the MCL holdout (0.953 → 0.927). A second seed did not (0.957), so it was seed noise.
+
+**Seeds and other models** (MOAKS-pretrained vs ImageNet init, 58 / holdout):
+- **OA model, 3 seeds:**
+  - medial OA 0.984–0.986 vs 0.978;
+  - lateral OA 0.878–0.897 / 0.910–0.915 vs 0.882 / 0.905;
+  - PF OA 0.909–0.915 vs 0.889.
+- **The other OA ensemble members (37, 42, 43) and the PF OA model (83):**
+  - PF OA +0.014 to +0.026 on the 58 in all six models;
+  - lateral OA +0.003 to +0.013 on the holdout in all six;
+  - medial OA +0.002 to +0.017 on the 58 in all six.
+- **"All" model, 2 seeds:** 0.952 / 0.943 and 0.952 / 0.945, vs 0.946 / 0.942.
+
+**Multi-task joint training.** One model learns our findings on our crops and the 25 MOAKS gradings on OAI crops at the same time (groups `oa_moaks`, `all_moaks`).
+- OA, OAI weight 0.25: 0.921 / 0.932 and 0.910 / 0.928 over 2 seeds (ref 0.917 / 0.928).
+- OA, OAI weight 1: 0.924 / 0.926.
+- "All": 0.952 / 0.946 (ref 0.946 / 0.942).
+
+This is about the same as pretraining followed by fine-tuning.
+
+**Recipe level** (`dataset_6` recipe; 8 ROI findings, 58 / holdout):
+
+| Recipe | 8 ROI |
+|---|---|
+| `dataset_6` | 0.9610 / 0.9498 |
+| OA models replaced by their MOAKS-pretrained versions | 0.9601 / 0.9504 |
+| **MOAKS-pretrained OA models added**: 8 OA models; PF OA = 83 + its MOAKS version | **0.9624 / 0.9501** |
+| + a MOAKS-pretrained "all" model added for MCL, menisci and Baker's | 0.9609 / 0.9495 |
+| + a multi-task "all" model added instead | 0.9614 / 0.9505 |
+
+Through the inference pipeline, the "added" recipe scores 0.961 on the 8 ROI findings vs 0.960 for `dataset_6`: medial OA 0.983, lateral OA 0.901, PF OA 0.914. It is packaged as `output/dataset_7` with fullfit fine-tunes.
+
+**Last two checks.**
+- **MOAKS pretraining for the menisci CoAtNet** (224 px, the backbone of the menisci recipe): lateral meniscus 0.938 / 0.923 and medial 0.974 / 0.957. That is within the range of the two existing CoAtNet seeds (0.913–0.942 / 0.925–0.926 and 0.968–0.977 / 0.952–0.955).
+- **20-epoch MOAKS pretraining** instead of 10, then the OA fine-tune: 0.985 / 0.947, 0.863 / 0.912, 0.914 / 0.931. The same as with 10 epochs, so longer pretraining does not help.
+
+**Conclusions.**
+- **What helps:** fine-grained MOAKS supervision (pretraining or multi-task) gives slightly better single models, about +0.005. Mostly for OA, PF OA in particular.
+- **What doesn't:** joint training on derived OAI labels, OAI-teacher pseudo-labels, OAI for effusion, synovitis, ACL and Baker's, and OAI axial (DESS reformat) data for PF OA.
+- **At the ensemble level** the gain shrinks to +0.001 to +0.002, within noise. OAI is not a big lever here: the domain (3 T research sequences, older OA-enriched cohort) and the label definitions differ from ours. The ensembles already capture most of what the extra supervision adds.
+- **The clearest qualitative effect:** OAI labels teach compartment separation. The medial–lateral OA prediction correlation of an OAI-only model is 0.14, vs 0.84 for models trained on our labels.
+
+## 17. DINOv2 ViT-S
+
+`vit_small_patch14_dinov2.lvd142m` (21.6M params; also the `reg4` registers variant) as the crop encoder. The setup is run 75's: `all` model, 8-frame crops, BiLSTM head, PL round 2, no external data. The 128 px crops are resized to the patch grid: 224 px (16 × 16 patches) or 126 px (9 × 9). The backbone learning rate is 3–10× below ConvNeXt's 1e-4. AUC on the 58 / holdout:
+
+| Encoder | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | Mean |
+|---|---|---|---|---|---|---|---|---|---|
+| ConvNeXt-tiny 128 (run 75) | 0.973 / 0.991 | **0.984 / 0.953** | 0.976 / 0.950 | **0.935** / 0.911 | 0.969 / **0.947** | 0.859 / 0.898 | 0.880 / **0.924** | **0.993** / 0.966 | **0.946** / 0.942 |
+| DINOv2 ViT-S 224, lr 3e-5 | 0.968 / 0.992 | 0.971 / 0.934 | 0.986 / 0.957 | 0.923 / 0.917 | 0.972 / 0.940 | **0.870** / 0.898 | 0.894 / 0.920 | 0.987 / 0.965 | **0.946** / 0.940 |
+| DINOv2 ViT-S 224, lr 1e-5 | **0.974 / 0.993** | 0.964 / 0.932 | **0.995** / 0.956 | 0.906 / **0.920** | **0.975** / 0.942 | 0.861 / 0.892 | **0.898** / 0.921 | 0.982 / **0.972** | 0.944 / 0.941 |
+| DINOv2 ViT-S + registers 224, lr 3e-5 | 0.971 / **0.993** | 0.966 / 0.939 | 0.990 / **0.959** | 0.903 / 0.916 | 0.974 / 0.943 | 0.849 / **0.904** | 0.897 / **0.924** | 0.987 / 0.966 | 0.942 / **0.943** |
+| DINOv2 ViT-S 126, lr 3e-5 | **0.974** / 0.992 | 0.971 / 0.933 | 0.975 / 0.943 | 0.886 / 0.902 | 0.960 / 0.939 | 0.839 / 0.889 | 0.879 / 0.921 | 0.987 / 0.965 | 0.934 / 0.936 |
+
+- **Overall level with ConvNeXt-tiny at 224 px.** It is clearly worse at 126 px: the patch grid is too coarse.
+- **Medial meniscus: consistently better** on both metrics in all three 224 px runs (0.986–0.995 / 0.956–0.959 vs 0.976 / 0.950).
+- **MCL: consistently worse** (−0.015 on the 58, −0.015 to −0.021 on the holdout).
+- **Learning rate:** 1e-5 and 3e-5 end up the same; the registers variant adds nothing.
+- **Ensembles:** ConvNeXt + DINOv2 scores 0.947–0.948 / 0.943–0.944. In the menisci recipe, DINOv2 adds at most +0.003 to the medial meniscus and costs the lateral up to 0.012. Not adopted.
+
 ## Next steps
 
 - ROIs and crop models for the 4 remaining findings: capsule / joint recesses for effusion and synovitis, bone for contusion and fracture.

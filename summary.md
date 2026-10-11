@@ -24,11 +24,20 @@ The last block replaces the 4 non-ROI findings by b1_c1's predictions, the confi
 | All 12 (`output/dataset_3`) | 0.972 | **0.994** | **0.977** | **0.934** | 0.974 | 0.868 | **0.905** | **0.991** | 0.975 | 0.786 | 0.942 | 0.947 | 0.952 | 0.939 | |
 | All 12 + new OA (`output/dataset_4`) | 0.972 | **0.994** | **0.977** | **0.934** | 0.978 | **0.903** | **0.905** | **0.991** | 0.975 | 0.786 | 0.942 | 0.947 | 0.957 | 0.942 | |
 | All 12 + new OA + new ACL (`output/dataset_5`) | **0.993** | **0.994** | **0.977** | **0.934** | 0.978 | **0.903** | **0.905** | **0.991** | 0.975 | 0.786 | 0.942 | 0.947 | **0.959** | **0.944** | |
+| + MCL HGNetV2, menisci 2 seeds (`output/dataset_6`) | **0.993** | **0.994** | 0.975 | **0.937** | 0.978 | **0.903** | **0.905** | **0.991** | 0.975 | 0.786 | 0.942 | 0.947 | **0.960** | **0.944** | |
+| + MOAKS-pretrained OA models (`output/dataset_7`) | **0.993** | **0.994** | 0.975 | **0.937** | 0.983 | 0.901 | **0.914** | **0.991** | 0.975 | 0.786 | 0.942 | 0.947 | **0.961** | **0.945** | |
 | *8 ROI models + b1_c1 for effusion, synovitis, contusion, fracture* | | | | | | | | | | | | | | | |
 | `dataset_1` + b1_c1 (submitted) | 0.972 | **0.994** | 0.975 | 0.920 | 0.974 | 0.872 | 0.897 | 0.986 | **0.989** | **0.851** | **0.955** | **0.953** | 0.949 | 0.945 | **0.962** |
 | `kaggle_weights` + b1_c1 | 0.972 | **0.994** | **0.977** | **0.934** | 0.974 | 0.868 | **0.905** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.952 | 0.947 |  |
 | `dataset_4` + b1_c1 | 0.972 | **0.994** | **0.977** | **0.934** | 0.978 | **0.903** | **0.905** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.957 | 0.950 |  |
 | `dataset_5` + b1_c1 | **0.993** | **0.994** | **0.977** | **0.934** | 0.978 | **0.903** | **0.905** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.959** | **0.952** |  |
+| `dataset_6` + b1_c1 | **0.993** | **0.994** | 0.975 | **0.937** | 0.978 | **0.903** | **0.905** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.960** | **0.952** |  |
+| `dataset_7` + b1_c1 | **0.993** | **0.994** | 0.975 | **0.937** | 0.983 | 0.901 | **0.914** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.961** | **0.953** |  |
+| `dataset_2_moaks` + b1_c1 (submitted; `dataset_2` with MOAKS-pretrained OA models) | 0.972 | **0.994** | **0.977** | **0.934** | 0.977 | 0.878 | **0.923** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.956 | 0.950 | `dataset_2` + ~0.001 |
+| `dataset_2_moaks_mrnet` + b1_c1 (`dataset_2_moaks` + ACL with MRNet + MCL with MRNet pseudo-labels) | 0.983 | **0.996** | 0.978 | 0.945 | 0.977 | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.959 | | |
+| `dataset_2_moaks_mrnet_ext` + b1_c1 (+ OAI/MRNet `all` for med. men. / med. OA) | 0.983 | **0.996** | **0.982** | 0.945 | **0.980** | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.960** | | |
+
+Note: the `dataset_2_moaks_mrnet` and `dataset_2_moaks_mrnet_ext` rows are on a different scale from the rows above: recipe-level evaluation of the validation (non-fullfit) runs (`src/ext/recipe_eval.py`, external_data.md §6.4). On that scale `dataset_2_moaks` scores 0.957 (ACL 0.975, MCL 0.991, med. men. 0.978, lat. men. 0.945, med. OA 0.977, lat. OA 0.878, PF OA 0.923, Baker's 0.991); compare against that. The 12-finding column is left empty.
 
 What each folder contains:
 
@@ -46,6 +55,15 @@ What each folder contains:
   - ACL now uses 4 ACL-only models with axial crops, one per architecture: ConvNeXt, CAFormer-S18, ConvNeXt with a transformer head, and HGNetV2-B2.
   - Runs 10/65, 10/77, 10/78 and 10/79, fullfit as 10/81–10/84.
   - The `all` model is no longer used for ACL. See `experiments.md` §15.
+- **`dataset_6`:** two changes, both chosen on the holdout.
+  - MCL: an HGNetV2-B2 specialist with axial crops (run 10/87, fullfit 10/98) replaces the ConvNeXt one. MCL holdout 0.942 → 0.954.
+  - Menisci: a second seed of the CoAtNet specialist (run 10/97, fullfit 10/99) is added. Seeds differ by ±0.03 on the lateral meniscus on the 58, so averaging two makes it more robust.
+  - On the 58 it scores the same as `dataset_5`.
+- **`dataset_7`:** adds MOAKS-pretrained versions of the OA models.
+  - Each crop model was first trained on OAI (2,400 knees, 25 MOAKS gradings), then fine-tuned on our data.
+  - Medial/lateral OA use 8 models (the 4 current + 4 MOAKS-pretrained); PF OA uses 2 (90 + its MOAKS version).
+  - Fullfits: 2026-10-11/24–28.
+  - On the 58: +0.001 (8 ROI), mostly PF OA 0.905 → 0.914 and medial OA 0.978 → 0.983. Holdout flat. See `experiments.md` §16.
 
 Findings:
 

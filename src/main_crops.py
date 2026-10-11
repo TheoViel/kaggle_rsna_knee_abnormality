@@ -19,7 +19,7 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
-from crops.train import GROUPS, CropDataset, build_model, fit, load_crops  # noqa: E402
+from crops.train import GROUPS, CropDataset, PairDataset, build_model, fit, load_crops  # noqa: E402
 from knee_cls.data import load_tables, make_splits  # noqa: E402
 from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
@@ -33,6 +33,15 @@ DEFAULTS = {
     "planes": "Sagittal,Coronal", "num_workers": 8, "seed": 0,
     "labels": "claude",
     "fullfit": False,
+    # Regularisation (crops.train.model_input / mix_batch): context crops (ctx > 1) with random
+    # window shifts, random slice windows of depth_out slices, mixup / cutmix within a finding.
+    # External data (OAI, see src/oai/): extra crop sets with their own labels; loss weight; OAI only
+    # (pretraining); initial weights (fine-tuning); OAI sequences to keep.
+    "extra_crops": "", "extra_labels": "", "extra_weight": 1.0, "extra_only": False, "init": "", "extra_seqs": "",
+    # Multiple-instance meniscus bags (crops.train.PairDataset): series of a crop set whose exam has a tear
+    # of unknown side (--mil_labels csv, StudyInstanceUID + --mil_col == 1); loss on max(medial, lateral).
+    "mil_crops": "", "mil_labels": "", "mil_col": "mrnet_meniscus", "mil_weight": 1.0, "mil_bs": 4,
+    "ctx": 1.0, "crop_jitter": 0.0, "depth_out": 0, "slice_jitter": 0, "mixup": 0.0, "cutmix": 0.0, "mix_alpha": 0.4,
     "augmentations": {"rot_deg": 15.0, "scale_range": (0.85, 1.15), "shift": 0.08,
                       "gamma": 0.3, "contrast": 0.25, "brightness": 0.1},
     "log_path": LOG_FOLDER + "crops_run/",
@@ -51,9 +60,9 @@ def training_targets(which, studies, classes):
     if which.startswith("pl:"):
         # Pseudo-labels: output/crops/<name>.csv, StudyInstanceUID x findings (crops/predict.py + teacher averaging).
         pl = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{which[3:]}.csv")).set_index("StudyInstanceUID")
-        return {c: pl[c] for c in classes}
+        return {c: pl[c] if c in pl else pd.Series(dtype=float) for c in classes}
     if which == "claude":
-        return {c: claude[f"target_{c}"] for c in classes}
+        return {c: claude[f"target_{c}"] if f"target_{c}" in claude else pd.Series(dtype=float) for c in classes}
     codex = pd.concat([pd.read_csv(f"{INPUT_FOLDER}codex-labels_final_{n}.csv") for n in (52, 4349)])
     codex = codex.set_index("StudyInstanceUID")
     if which == "codex":
@@ -94,23 +103,41 @@ def main():
         json.dump(vars(args), open(os.path.join(args.output_dir, "args.json"), "w"), indent=4, default=str)
 
     crops, info = load_crops(args.crops)
+    extra = None
+    if args.extra_crops:
+        e_crops, extra = load_crops(args.extra_crops)
+        crops.update(e_crops)
+        extra = extra[extra.Anatomical_Plane.isin(args.planes.split(","))]
+        if args.extra_seqs:
+            extra = extra[extra.seq.isin(args.extra_seqs.split(","))]
     info = info[info.Anatomical_Plane.isin(args.planes.split(","))]
     studies, _ = load_tables()
     _, gt_ids, hold_ids = make_splits(studies, holdout_frac=0.1, seed=0)
     val_mask = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
     classes = GROUPS[args.group]
     targets = training_targets(args.labels, studies, classes)
+    if extra is not None:
+        lab = pd.read_csv(args.extra_labels).set_index("StudyInstanceUID")
+        for c in classes:
+            targets[c] = pd.concat([targets[c], lab[c]]) if c in lab else targets[c]
     if args.fullfit:
         # Fullfit (submission models): every study is trained on. The 58 radiologist studies
         # take their radiologist labels; every other study keeps the chosen soft labels.
         st_ = studies.set_index("StudyInstanceUID")
         for c in classes:
-            t = targets[c].reindex(st_.index)
-            gt = st_[f"gt_{c}"]
+            if f"gt_{c}" not in st_:          # no radiologist labels (e.g. MOAKS targets): unchanged
+                continue
+            idx = targets[c].index.union(st_.index)          # keep extra-data (OAI) studies
+            t = targets[c].reindex(idx)
+            gt = st_[f"gt_{c}"].reindex(idx)
             targets[c] = t.where(gt.isna(), gt)
         train_ds = CropDataset(crops, info, classes, targets)
     else:
         train_ds = CropDataset(crops, info[~val_mask], classes, targets)
+    if extra is not None:
+        tr_info = extra if args.extra_only else pd.concat([info if args.fullfit else info[~val_mask], extra], ignore_index=True)
+        train_ds = CropDataset(crops, tr_info, classes, targets)
+        train_ds.items["w"] = np.where(train_ds.items.src.isin(args.extra_crops.split(",")), args.extra_weight, 1.0)
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
     val_ds = CropDataset(crops, info[val_mask], classes, training_targets("claude", studies, classes))
     if ctx.is_main:
@@ -126,15 +153,36 @@ def main():
                           worker_init_fn=worker_init_fn), s
 
     train_dl, sampler = dl(train_ds, True)
+    mil_dl = None
+    if args.mil_crops:
+        m_crops, m_info = load_crops(args.mil_crops)
+        crops.update(m_crops)
+        pos = pd.read_csv(args.mil_labels).set_index("StudyInstanceUID")[args.mil_col]
+        m_info = m_info[m_info.Anatomical_Plane.isin(args.planes.split(",")) & m_info.StudyInstanceUID.map(pos).eq(1)]
+        mil_ds = PairDataset(crops, m_info, classes)
+        s = DistributedSampler(mil_ds, shuffle=True, drop_last=True) if ctx.distributed else None
+        mil_dl = DataLoader(mil_ds, batch_size=args.mil_bs, sampler=s, shuffle=s is None, drop_last=True,
+                            num_workers=2, pin_memory=True, worker_init_fn=worker_init_fn)
+        if ctx.is_main:
+            print(f"- MIL bags: {len(mil_ds)} series ({m_info.StudyInstanceUID.nunique()} exams), {args.mil_bs} per step")
     val_dl, _ = dl(val_ds, False)
-    model = build_model(vars(args), len(classes), pretrained=True).to(ctx.device)
+    model = build_model(vars(args), len(classes), pretrained=True)
+    if args.init:
+        sd = torch.load(os.path.join(args.init, "ckpt_final.pt"), map_location="cpu")
+        own = model.state_dict()
+        skipped = [k for k in sd if k in own and sd[k].shape != own[k].shape]   # e.g. the finding embeddings
+        sd = {k: v for k, v in sd.items() if k not in skipped}
+        res = model.load_state_dict(sd, strict=False)
+        if ctx.is_main:
+            print(f"init from {args.init}: skipped (shape) {skipped}, missing {res.missing_keys}")
+    model = model.to(ctx.device)
     if ctx.distributed:
         # One ROI embedding row, or modules a variant skips (early: the slice pooling; map3d: the encoder head).
         unused = len(classes) == 1 or args.fusion == "early" or args.head == "map3d"
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ctx.device.index],
                                                           find_unused_parameters=unused)
     try:
-        tab = fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler)
+        tab = fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=mil_dl)
         if ctx.is_main:
             print(f"FINAL gt {tab["gt"].mean():.4f} hold {tab["hold"].mean():.4f}\n{tab.round(4).to_string()}")
     finally:

@@ -59,9 +59,9 @@ def _series(args):
     import torch
 
     torch.set_num_threads(1)
-    r, union, rois, flip, depth, size = args
+    r, union, rois, flip, depth, size, cache_dir = args
     sag = r["Anatomical_Plane"] == "Sagittal"
-    cache = np.load(os.path.join(CACHE_DIR, f"{r['SeriesInstanceUID']}.npy"))
+    cache = np.load(os.path.join(cache_dir, f"{r['SeriesInstanceUID']}.npy"))
     n_c, cs = cache.shape[0], cache.shape[1]
     crop = crop_box(cache, union, r["n_slices"], r["rows"], r["cols"], flip, sag, depth=depth, size=size,
                     margin=0.0, min_side=0, z_mode="resize")
@@ -81,22 +81,29 @@ def main():
     p.add_argument("--depth", type=int, default=32)
     p.add_argument("--size", type=int, default=256)
     p.add_argument("--limit", type=int, default=0)
+    # External data (OAI, `src/oai/`): its own series table, boxes, caches and known knee sides.
+    p.add_argument("--volumes", default="", help="series table .csv (default: output/roi/volumes.csv)")
+    p.add_argument("--cache_dir", default=CACHE_DIR)
+    p.add_argument("--side_csv", default="", help="SeriesInstanceUID, side (R / L) instead of the side classifier's")
     a = p.parse_args()
     os.makedirs(MT_DIR, exist_ok=True)
-    vols = pd.read_csv(os.path.join(OUTPUT_FOLDER, "roi", "volumes.csv"))
+    vols = pd.read_csv(a.volumes or os.path.join(OUTPUT_FOLDER, "roi", "volumes.csv"))
+    vols = vols[vols.Anatomical_Plane.isin(["Sagittal", "Coronal"])].reset_index(drop=True)
     if a.limit:
         vols = vols.iloc[:a.limit]
     fat = pd.read_csv(os.path.join(INPUT_FOLDER, "train_series.csv")).set_index("SeriesInstanceUID").Fat_Suppression
-    pred = pd.read_csv(os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
+    pred = pd.read_csv(a.boxes if a.boxes.endswith(".csv") else os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
     pred = pred[pred.z0.notna()]
     shape = {r.SeriesInstanceUID: (r.rows, r.cols) for r in vols.itertuples()}
     unions = capsule_boxes(pred[pred.SeriesInstanceUID.isin(shape)], a.expand, None, shape)
     rois = {}
     for r in pred.to_dict("records"):
         rois.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in BOX}
-    side = series_side()
+    side = series_side() if not a.side_csv else dict(pd.read_csv(a.side_csv)[["SeriesInstanceUID", "side"]].values)
+    # Every series needs its 8 boxes (OAI: a few series lack some).
+    vols = vols[vols.SeriesInstanceUID.map(lambda u: len(rois.get(u, {})) == len(ROI_CLASSES))].reset_index(drop=True)
     jobs = [(r, unions[r["SeriesInstanceUID"]]["Capsule"], rois[r["SeriesInstanceUID"]],
-             side.get(r["SeriesInstanceUID"]) == "L", a.depth, a.size) for r in vols.to_dict("records")]
+             side.get(r["SeriesInstanceUID"]) == "L", a.depth, a.size, a.cache_dir) for r in vols.to_dict("records")]
     arr = np.lib.format.open_memmap(os.path.join(MT_DIR, f"{a.name}.npy"), mode="w+", dtype=np.uint8,
                                     shape=(len(jobs), a.depth, a.size, a.size))
     boxes = np.zeros((len(jobs), len(ROI_CLASSES), 6), np.float32)

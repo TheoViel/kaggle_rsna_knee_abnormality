@@ -202,13 +202,13 @@ def _series(args):
     import torch
 
     torch.set_num_threads(1)
-    r, boxes, flip, z, classes, size, margin = args
-    cache = np.load(os.path.join(CACHE_DIR, f"{r['SeriesInstanceUID']}.npy"))
+    r, boxes, flip, z, classes, size, margin, min_side, cache_dir = args
+    cache = np.load(os.path.join(cache_dir, f"{r['SeriesInstanceUID']}.npy"))
     out = np.zeros((len(classes), z["depth"], size, size), np.uint8)
     for k, c in enumerate(classes):
         if c in boxes:
             out[k] = crop_box(cache, boxes[c], r["n_slices"], r["rows"], r["cols"], flip,
-                              r["Anatomical_Plane"] == "Sagittal", size=size, margin=margin, **z)
+                              r["Anatomical_Plane"] == "Sagittal", size=size, margin=margin, min_side=min_side, **z)
     return out
 
 
@@ -219,7 +219,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--boxes", default="round3_pred")
     p.add_argument("--name", default="r3")
-    p.add_argument("--volumes", default="volumes", help="output/roi/<volumes>.csv: volumes (sag + cor) or volumes_axial")
+    p.add_argument("--volumes", default="volumes", help="output/roi/<volumes>.csv (volumes or volumes_axial), or a path to a .csv")
     p.add_argument("--depth", type=int, default=DEPTH, help="frames per crop")
     p.add_argument("--z_mode", default="uniform", choices=["uniform", "strided", "resize"])
     p.add_argument("--stride", type=int, default=1, help="slices between frames (strided)")
@@ -230,6 +230,9 @@ def main():
     p.add_argument("--union", default="", help="with --capsule: comma-separated ROIs whose union is the box "
                                                "(default: all 8)")
     p.add_argument("--margin", type=float, default=MARGIN, help="in-plane context around ROI boxes (x side)")
+    p.add_argument("--min_side", type=float, default=MIN_SIDE, help="smallest crop window, cache px")
+    p.add_argument("--cache_dir", default=CACHE_DIR, help="384 px caches (default: the competition's)")
+    p.add_argument("--side_csv", default="", help="SeriesInstanceUID, side (R / L) instead of the side classifier's")
     p.add_argument("--oa_midline", default="", choices=["", "slide", "clip"],
                    help="coronal / axial medial and lateral OA crops stop at the intercondylar midline "
                         "(slide: the window moves outward; clip: the box is also cut at the midline)")
@@ -242,8 +245,8 @@ def main():
     a = p.parse_args()
     z = dict(depth=a.depth, z_mode=a.z_mode, stride=a.stride)
     os.makedirs(CROP_DIR, exist_ok=True)
-    vols = pd.read_csv(os.path.join(OUTPUT_FOLDER, "roi", f"{a.volumes}.csv"))
-    pred = pd.read_csv(os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
+    vols = pd.read_csv(a.volumes if a.volumes.endswith(".csv") else os.path.join(OUTPUT_FOLDER, "roi", f"{a.volumes}.csv"))
+    pred = pd.read_csv(a.boxes if a.boxes.endswith(".csv") else os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
     pred = pred[pred.z0.notna()]
     boxes = {}
     if a.capsule is not None:
@@ -280,10 +283,11 @@ def main():
             z.update(oa_midline=a.oa_midline)
         z.update(margin=a.margin)
     z["size"] = a.size
-    side = series_side()
+    side = series_side() if not a.side_csv else dict(pd.read_csv(a.side_csv)[["SeriesInstanceUID", "side"]].values)
     zc = {k: z[k] for k in ("depth", "z_mode", "stride")}
     jobs = [(r, boxes.get(r["SeriesInstanceUID"], {}), side.get(r["SeriesInstanceUID"]) == "L", zc, classes, a.size,
-             margin) for r in vols.to_dict("records")]
+             margin, a.min_side, a.cache_dir) for r in vols.to_dict("records")]
+    z["min_side"] = a.min_side
     arr = np.lib.format.open_memmap(os.path.join(CROP_DIR, f"{a.name}.npy"), mode="w+", dtype=np.uint8,
                                     shape=(len(jobs), len(classes), a.depth, a.size, a.size))
     with ProcessPoolExecutor(96) as ex:

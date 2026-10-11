@@ -27,13 +27,13 @@ RUNS_DIR = "../logs/crops_run/2026-10-09/"
 
 
 @torch.no_grad()
-def predict_run(run, device):
+def predict_run(run, device, crop_set=""):
     from crops.train import GROUPS, CropDataset, build_model, load_crops
 
     d = os.path.join(RUNS_DIR, run)
     a = json.load(open(os.path.join(d, "args.json")))
     classes = GROUPS[a["group"]]
-    crops, info = load_crops(a.get("crops", "r3"))
+    crops, info = load_crops(crop_set or a.get("crops", "r3"))
     info = info[info.Anatomical_Plane.isin(a["planes"].split(","))]
     dummy = {c: pd.Series(0.0, index=info.StudyInstanceUID.unique()) for c in classes}
     ds = CropDataset(crops, info, classes, dummy)
@@ -53,7 +53,7 @@ def predict_run(run, device):
             ps.append(torch.sigmoid(model(x, b["roi"].to(device), b["plane"].to(device)).float()).cpu().numpy())
     it = ds.items.assign(p=np.concatenate(ps))
     tab = it.groupby(["StudyInstanceUID", "cls"]).p.mean().unstack()
-    tab.to_csv(os.path.join(d, "all_study_preds.csv"))
+    tab.to_csv(os.path.join(d, f"{crop_set}_study_preds.csv" if crop_set else "all_study_preds.csv"))
     print(f"run {run}: {tab.shape[0]} studies x {list(tab.columns)}", flush=True)
 
 
@@ -62,18 +62,19 @@ def main():
     p.add_argument("--runs", required=True)
     p.add_argument("--gpus", default="0")
     p.add_argument("--worker", type=int, default=None)
+    p.add_argument("--crops", default="", help="crop set(s) to predict instead of the run's own (e.g. external data)")
     a = p.parse_args()
     runs = a.runs.split(",")
     gpus = a.gpus.split(",")
     if a.worker is None and len(gpus) > 1:
         procs = [subprocess.Popen([sys.executable, "-m", "crops.predict", "--runs", ",".join(runs[i::len(gpus)]),
-                                   "--gpus", g, "--worker", str(i)], env=dict(os.environ, CUDA_VISIBLE_DEVICES=g))
+                                   "--gpus", g, "--worker", str(i)] + (["--crops", a.crops] if a.crops else []), env=dict(os.environ, CUDA_VISIBLE_DEVICES=g))
                  for i, g in enumerate(gpus) if runs[i::len(gpus)]]
         sys.exit(max(p.wait() for p in procs))
     if len(gpus) == 1 and a.worker is None:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpus[0])
     for r in runs:
-        predict_run(r, torch.device("cuda"))
+        predict_run(r, torch.device("cuda"), a.crops)
 
 
 if __name__ == "__main__":

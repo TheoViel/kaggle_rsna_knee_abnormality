@@ -22,6 +22,11 @@ reorganised for a small machine (Kaggle: 2 x T4, 4 CPU cores):
   - each crop model only predicts the findings the recipe takes from it;
   - float16 autocast, fixed batch shapes (zero padded); crop sampling (frames, stride)
     read from each crop model's args.json, crops cut once per distinct sampling.
+Hybrid multitask models (src_bis/mt3d, weights in <weights>/mt3d/<name>/) reuse the same
+caches, sides and consensus boxes: one joint crop per sagittal / coronal series (the union of its
+8 ROI boxes + 10%, `mt3d.prepare`), the study's series grouped 4 at a time as in validation
+(`mt3d.train.PairDataset`), one prediction per group, averaged per study (`hybrid_predict`).
+A recipe entry can be a nested list of models: their mean rank counts as one member.
 The shards' per-model study probabilities are then gathered and combined per the
 recipe (rank average over all test studies) into the submission; findings the
 recipe does not cover stay at 0.5.
@@ -55,6 +60,8 @@ ROI_PLANES = ("Sagittal", "Coronal")
 VOL_DEPTH, VOL_SIZE = 32, 128            # roi.prepare.cache_to_volume
 SIDE_BATCH, UNET_BATCH, CROP_BATCH = 64, 16, 64
 CHUNK = 24                               # studies per GPU chunk
+HYBRID_GROUPS = 4                        # study groups (of `slots` series) per hybrid forward
+AMP_DTYPE = torch.float16                # hybrid autocast: bfloat16 = as validated; None = float32 (exactness checks)
 
 
 def list_series(data_dir, series_dir, series_csv):
@@ -228,6 +235,98 @@ def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal, depth=12, z_mo
 # ------------------------------------------------------------------------ models
 
 
+def flat(models):
+    """A recipe entry's models, nested lists (sub-ensembles) flattened."""
+    return [m for x in models for m in (flat(x) if isinstance(x, list) else [x])]
+
+
+def load_hybrid(d, name, device):
+    """A src_bis/mt3d run folder (args.json + ckpt_final.pt, the EMA weights) -> its network, as validated."""
+    from mt3d.evaluate import zoom_rois
+    from mt3d.hybrid import Hybrid, PairHybrid
+    from mt3d.prepare import MT_DIR
+
+    a = json.load(open(os.path.join(d, "args.json")))
+    assert a["arch"] == "hybrid" and a["pair"] and a.get("w_anat", 0) == 0 and not a.get("zoom") \
+        and a.get("pool", "pred") == "pred" and a.get("findings", "roi8") == "roi8", f"unsupported hybrid run {d}"
+    base = Hybrid(a["backbone"], frames=a["frames"], dec=a["dec"], dim=a["dim"], tf_layers=a["tf_layers"],
+                  pretrained=False, levels=[int(v) for v in str(a["levels"]).split(",")], nb=a.get("nb", 1),
+                  zoom=zoom_rois(a.get("zoom", "")))
+    net = PairHybrid(base, a["slots"])
+    net.load_state_dict(torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu"))
+    # The joint crop it was trained on: crop.json in the weights folder (packaged), else the training crop set's.
+    cj = os.path.join(d, "crop.json")
+    crop = json.load(open(cj if os.path.exists(cj) else os.path.join(MT_DIR, f"{a['crops']}.json")))
+    return dict(name=name, net=net.to(device).eval(), slots=a["slots"], size=a["size"], depth=crop["depth"],
+                crop=dict(expand=crop["expand"], depth=crop["depth"], size=crop["size"]))
+
+
+def hybrid_crops(rows, rois, crop):
+    """Joint crops (`mt3d.prepare`) of the sagittal / coronal series with all 8 ROI boxes:
+    -> (series rows kept, (N, depth, size, size) uint8 on the GPU)."""
+    from crops.prepare import capsule_boxes
+
+    rows = [s for s in rows if s["plane"] in ROI_PLANES]
+    n_cls = rois.groupby("SeriesInstanceUID")["class"].nunique() if len(rois) else pd.Series(dtype=int)
+    rows = [s for s in rows if n_cls.get(s["SeriesInstanceUID"], 0) == len(ROI_CLASSES)]
+    if not rows:
+        return [], None
+    shape = {s["SeriesInstanceUID"]: (s["rows"], s["cols"]) for s in rows}
+    union = capsule_boxes(rois[rois.SeriesInstanceUID.isin(shape)], crop["expand"], None, shape)
+    out = torch.stack([gpu_crops(s["cache"], union[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
+                                 (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", depth=crop["depth"],
+                                 z_mode="resize", size=crop["size"], classes=["Capsule"], margin=0.0)[0][0]
+                       for s in rows])
+    return rows, out
+
+
+def study_groups(rows, slots):
+    """Series of each study -> validation groups (`mt3d.train.PairDataset`, slots > 2): sagittal and coronal
+    interleaved in series order, chunks of `slots`, missing slots repeat the first series (invalid)."""
+    from mt3d.train import PairDataset
+
+    by = {}
+    for i, s in enumerate(rows):
+        by.setdefault(s["StudyInstanceUID"], ([], []))[0 if s["plane"] == "Sagittal" else 1].append(i)
+    groups = []
+    for st, (sag, cor) in by.items():
+        order = PairDataset._interleave(sag, cor)
+        for j in range(0, len(order), slots):
+            g = order[j:j + slots]
+            groups.append((st, g + [g[0]] * (slots - len(g)), [True] * len(g) + [False] * (slots - len(g))))
+    return groups
+
+
+@torch.no_grad()
+def hybrid_predict(h, rows, crops):
+    """One hybrid model over the joint crops -> [(model, study, finding, p)]: mean over the study's groups."""
+    from mt3d.hybrid import PLANES as H_PLANES
+
+    dev, out = crops.device, []
+    groups = study_groups(rows, h["slots"])
+    plane = torch.tensor([H_PLANES.index(s["plane"]) for s in rows], device=dev)
+    for i in range(0, len(groups), HYBRID_GROUPS):
+        part = groups[i:i + HYBRID_GROUPS]
+        n = len(part)
+        idx = torch.tensor([j for _, g, _ in part for j in g], device=dev)
+        valid = torch.tensor([v for _, _, v in part], device=dev)
+        x = crops[idx].float()[:, None] / 255                                  # (n * slots, 1, D, S, S)
+        if x.shape[-1] != h["size"]:                                           # as mt3d.train.prepare_batch
+            x = F.interpolate(x, size=(x.shape[2], h["size"], h["size"]), mode="trilinear", align_corners=False)
+        pad = HYBRID_GROUPS - n                                                # fixed shapes
+        x = _padded(x, HYBRID_GROUPS * h["slots"])
+        pl = _padded(plane[idx], HYBRID_GROUPS * h["slots"])
+        valid = torch.cat([valid, torch.ones((pad, h["slots"]), dtype=torch.bool, device=dev)]) if pad else valid
+        with torch.autocast("cuda", dtype=AMP_DTYPE or torch.float16, enabled=AMP_DTYPE is not None):
+            p = torch.sigmoid(h["net"](x, pl, None, valid)["cls"].float())[:n].cpu().numpy()
+        out += [(st, p[k]) for k, (st, _, _) in enumerate(part)]
+    rows_out = []
+    for st in dict.fromkeys(st for st, _ in out):
+        p = np.mean([q for s2, q in out if s2 == st], 0)
+        rows_out += [(h["name"], st, c, float(v)) for c, v in zip(ROI_CLASSES, p)]
+    return rows_out
+
+
 def _padded(x, n):
     """Zero-pad the batch dimension to n (one shape per model: no re-planning per batch size)."""
     return x if len(x) == n else torch.cat([x, x.new_zeros((n - len(x),) + x.shape[1:])])
@@ -250,8 +349,11 @@ class Models:
         self.unet = build_model(num_classes=k)
         self.unet.load_state_dict(sd)
         self.unet = self.unet.to(device).eval()
-        self.crops = []
-        for m in sorted({m for r in recipe.values() for m in r["models"]}):
+        self.crops, self.hybrids = [], []
+        for m in sorted({m for r in recipe.values() for m in flat(r["models"])}):
+            if os.path.isdir(os.path.join(weights, "mt3d", m)):
+                self.hybrids.append(load_hybrid(os.path.join(weights, "mt3d", m), m, device))
+                continue
             d = os.path.join(weights, "crops", m)
             a = json.load(open(os.path.join(d, "args.json")))
             group = GROUPS[a["group"]]
@@ -264,7 +366,7 @@ class Models:
             net = net.to(device).eval()
             if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
                 net = net.to(memory_format=torch.channels_last)
-            used = [c for c in group if c in recipe and m in recipe[c]["models"]]     # findings taken from it
+            used = [c for c in group if c in recipe and m in flat(recipe[c]["models"])]     # findings taken from it
             z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
             z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
                                    "compartment", "oa_midline", "union") if k in z}
@@ -285,6 +387,12 @@ class Models:
                 i = z(CROP_BATCH, dtype=torch.long, device=self.device)
                 k = json.loads(m["z"])
                 m["net"](z((CROP_BATCH, k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device), i, i)
+        with torch.autocast("cuda", dtype=AMP_DTYPE or torch.float16, enabled=AMP_DTYPE is not None):
+            for h in self.hybrids:
+                n = HYBRID_GROUPS * h["slots"]
+                h["net"](z((n, 1, h["depth"], h["size"], h["size"]), device=self.device),
+                         z(n, dtype=torch.long, device=self.device), None,
+                         torch.ones((HYBRID_GROUPS, h["slots"]), dtype=torch.bool, device=self.device))
         torch.cuda.synchronize()
 
 
@@ -418,6 +526,19 @@ def process_chunk(studies, models, timer):
         dt = time.time() - t
         timer["models"] += dt
         timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
+    # Hybrid models: joint crops cut once from the same caches and consensus boxes, shared by all of them.
+    if models.hybrids:
+        t = time.time()
+        h_rows, h_crops = hybrid_crops(ser, rois, models.hybrids[0]["crop"])
+        assert all(h["crop"] == models.hybrids[0]["crop"] for h in models.hybrids), "hybrids need one crop set"
+        torch.cuda.synchronize()
+        timer["crops"] += time.time() - t
+        for h in models.hybrids if h_rows else []:
+            t = time.time()
+            out += hybrid_predict(h, h_rows, h_crops)
+            dt = time.time() - t
+            timer["models"] += dt
+            timer["model " + h["name"]] = timer.get("model " + h["name"], 0.0) + dt
     preds = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "p"])
     preds = preds.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
     series = series.assign(p_right=[s["p_right"] for s in ser],
@@ -496,9 +617,16 @@ def combine(preds, recipe, studies):
     corrections (score - beta x another finding's combined score)."""
     tab = {m: g.pivot(index="StudyInstanceUID", columns="cls", values="p") for m, g in preds.groupby("model")}
     study = pd.DataFrame(index=pd.Index(studies, name="StudyInstanceUID"))
+
+    def member(m, c):
+        """A model's column, or a nested list's mean rank (a sub-ensemble counted as one member)."""
+        if isinstance(m, list):
+            cols = [member(x, c) for x in m]
+            return cols[0] if len(cols) == 1 else sum(col.rank(pct=True) for col in cols) / len(cols)
+        return tab[m][c].reindex(study.index) if m in tab and c in tab[m] else pd.Series(np.nan, index=study.index)
+
     for c, r in recipe.items():
-        cols = [tab[m][c].reindex(study.index) if m in tab and c in tab[m] else
-                pd.Series(np.nan, index=study.index) for m in r["models"]]
+        cols = [member(m, c) for m in r["models"]]
         study[c] = cols[0] if len(cols) == 1 else sum(col.rank(pct=True) for col in cols) / len(cols)
     base = study.copy()
     for c, r in recipe.items():
@@ -509,9 +637,10 @@ def combine(preds, recipe, studies):
 
 
 def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_series", series_csv=None,
-        limit=None):
+        limit=None, amp="fp16", recipe_path=None):
     t0 = time.time()
-    recipe = load_recipe(os.path.join(weights, "recipe.json"))
+    recipe_path = recipe_path or os.path.join(weights, "recipe.json")
+    recipe = load_recipe(recipe_path)
     df = list_series(data_dir, series_dir, series_csv)
     if limit:
         df = df[df.StudyInstanceUID.isin(df.StudyInstanceUID.drop_duplicates()[:limit])]
@@ -526,7 +655,8 @@ def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_
         g = gpus[i]
         procs.append(subprocess.Popen(
             [sys.executable, "-m", "infer.pipeline", "--shard", str(i),
-             "--weights", weights, "--out_dir", out_dir, "--workers", str(workers)],
+             "--weights", weights, "--out_dir", out_dir, "--workers", str(workers), "--amp", amp,
+             "--recipe", recipe_path],
             env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(g))))
     if any(p.wait() for p in procs):
         raise RuntimeError("a shard failed")
@@ -557,15 +687,20 @@ def main():
     p.add_argument("--series_csv", default=None, help="series list (default: walk <data_dir>/<series_dir>)")
     p.add_argument("--limit", type=int, default=None, help="first N studies (debugging)")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--recipe", default=None, help="recipe file (default: <weights>/recipe.json)")
+    p.add_argument("--amp", default="fp16", choices=["fp16", "bf16", "fp32"],
+                   help="hybrid models' autocast dtype (bf16: as in validation, exact; fp16: T4)")
     a = p.parse_args()
+    global AMP_DTYPE
+    AMP_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[a.amp]
     if a.shard is not None:               # worker process, spawned by run()
-        recipe = load_recipe(os.path.join(a.weights, "recipe.json"))
+        recipe = load_recipe(a.recipe or os.path.join(a.weights, "recipe.json"))
         df = pd.read_csv(os.path.join(a.out_dir, "series_list.csv"))
         df = df[df["shard"] == a.shard]
         run_shard(df, a.weights, recipe, os.path.join(a.out_dir, f"shard{a.shard}"), a.workers)
         return
     run(a.data_dir, a.weights, a.out_dir, a.submission, a.gpus.split(","), a.workers, a.series_dir,
-        a.series_csv, a.limit)
+        a.series_csv, a.limit, a.amp, a.recipe)
 
 
 if __name__ == "__main__":

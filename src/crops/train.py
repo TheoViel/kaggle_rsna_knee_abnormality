@@ -48,12 +48,23 @@ GROUPS = {
     "joint4": ["Effusion", "Synovitis", "Contusion", "Fracture"], "bone": ["Contusion", "Fracture"],
     # Both tibiofemoral compartments from one crop that shows both (single-crop sets).
     "tf": ["Medial OA", "Lateral OA"],
+    # MOAKS gradings for multi-task pretraining on OAI ("<ROI>|<feature>", see oai.labels.aux_targets).
+    "moaks_aux": ['Medial OA|cart_size', 'Medial OA|cart_full', 'Medial OA|cart_sum', 'Medial OA|bml', 'Lateral OA|cart_size', 'Lateral OA|cart_full', 'Lateral OA|cart_sum', 'Lateral OA|bml', 'PF OA|cart_size', 'PF OA|cart_full', 'PF OA|cart_sum', 'PF OA|bml', 'Medial Meniscus|tear', 'Medial Meniscus|maceration', 'Medial Meniscus|signal', 'Medial Meniscus|extrusion', 'Lateral Meniscus|tear', 'Lateral Meniscus|maceration', 'Lateral Meniscus|signal', 'Lateral Meniscus|extrusion', 'ACL|tear', 'Medial OA|osteophyte', 'Lateral OA|osteophyte', 'PF OA|osteophyte', "Baker's|cyst"],
 }
+GROUPS.update({
+    # Multi-task joint training: our findings (our crops) + the MOAKS gradings (OAI crops) in one model.
+    "oa_moaks": ["Medial OA", "Lateral OA", "PF OA"] + GROUPS["moaks_aux"],
+    "all_moaks": list(ROI_CLASSES) + GROUPS["moaks_aux"],
+    # MRNet's exam-level "abnormal" label as an auxiliary target on every ROI crop (mrnet.labels --abn).
+    "all_abn": list(ROI_CLASSES) + [f"{c}|abnormal" for c in ROI_CLASSES],
+})
 CAPSULE_FINDINGS = ("Effusion", "Synovitis", "Contusion", "Fracture")      # findings read from the capsule crop
 
 
 def crop_index(c, single=False):
     """Index of a finding's crop in a crop set: its ROI, or the single capsule crop."""
+    if "|" in c:                      # MOAKS auxiliary target: the crop of its ROI
+        c = c.split("|")[0]
     return 0 if single or c in CAPSULE_FINDINGS else ROI_CLASSES.index(c)
 PLANES = ["Sagittal", "Coronal", "Axial"]
 
@@ -82,6 +93,8 @@ class CropDataset(Dataset):
             # roi: which crop of the series; rid: the finding's embedding row (its index in the group).
             rows.append(info.assign(roi=crop_index(c, single), rid=i, cls=c, target=info.StudyInstanceUID.map(targets[c])))
         self.items = pd.concat(rows, ignore_index=True).dropna(subset=["target"]).reset_index(drop=True)
+        if "w" not in self.items:
+            self.items["w"] = 1.0
 
     def __len__(self):
         return len(self.items)
@@ -90,11 +103,37 @@ class CropDataset(Dataset):
         r = self.items.iloc[i]
         return {"x": torch.from_numpy(np.array(self.crops[r.src][r.row, r.roi])),   # D S S uint8
                 "roi": torch.tensor(r.rid), "plane": torch.tensor(PLANES.index(r.Anatomical_Plane)),
-                "y": torch.tensor(float(r.target), dtype=torch.float32), "idx": torch.tensor(i)}
+                "y": torch.tensor(float(r.target), dtype=torch.float32), "idx": torch.tensor(i),
+                "w": torch.tensor(float(r.w), dtype=torch.float32)}
 
 
-def gpu_augment(x, aug):
-    """(B, D, S, S) float [0, 1]: one in-plane affine and intensity change per sample."""
+class PairDataset(Dataset):
+    """Multiple-instance bags: both meniscus crops of a series whose exam has a meniscal tear of unknown
+    side (MRNet). Training pushes max(medial, lateral) towards 1 (`fit`, `mil_dl`)."""
+
+    def __init__(self, crops, info, classes):
+        self.crops, self.items = crops, info.reset_index(drop=True)
+        self.rois = [ROI_CLASSES.index(c) for c in ("Medial Meniscus", "Lateral Meniscus")]
+        self.rids = [classes.index(c) for c in ("Medial Meniscus", "Lateral Meniscus")]
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        r = self.items.iloc[i]
+        a = self.crops[r.src]
+        return {"x": torch.from_numpy(np.stack([np.array(a[r.row, k]) for k in self.rois])),     # 2 D S S
+                "roi": torch.tensor(self.rids), "plane": torch.tensor(PLANES.index(r.Anatomical_Plane))}
+
+
+def gpu_augment(x, aug, ctx=1.0, crop_jitter=0.0):
+    """(B, D, S, S) float [0, 1]: one in-plane affine and intensity change per sample.
+
+    ctx > 1: x is a context crop (the usual window x ctx, at S = ctx x the output size); the
+    affine samples its central 1 / ctx part, so rotations, zoom-outs and shifts see real
+    anatomy instead of zero padding. crop_jitter: extra random shift of the window centre,
+    as a fraction of the (output) crop side.
+    """
     b = x.shape[0]
     dev = x.device
 
@@ -103,15 +142,73 @@ def gpu_augment(x, aug):
 
     ang = u(-aug["rot_deg"], aug["rot_deg"]) * math.pi / 180
     sc = u(*aug["scale_range"])
-    cos, sin = torch.cos(ang) / sc, torch.sin(ang) / sc
-    theta = torch.stack([torch.stack([cos, -sin, u(-aug["shift"], aug["shift"])], -1),
-                         torch.stack([sin, cos, u(-aug["shift"], aug["shift"])], -1)], 1)
-    grid = F.affine_grid(theta, x.shape, align_corners=False)
+    cos, sin = torch.cos(ang) / sc / ctx, torch.sin(ang) / sc / ctx
+    jit = 2 * crop_jitter / ctx
+    tx = u(-aug["shift"], aug["shift"]) / ctx + (u(-jit, jit) if crop_jitter else 0)
+    ty = u(-aug["shift"], aug["shift"]) / ctx + (u(-jit, jit) if crop_jitter else 0)
+    theta = torch.stack([torch.stack([cos, -sin, tx], -1), torch.stack([sin, cos, ty], -1)], 1)
+    out = round(x.shape[-1] / ctx)
+    grid = F.affine_grid(theta, (b, x.shape[1], out, out), align_corners=False)
     x = F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
     g = torch.exp(u(-aug["gamma"], aug["gamma"]))[:, None, None, None]
     c = (1 + u(-aug["contrast"], aug["contrast"]))[:, None, None, None]
     x = ((x.clamp(0, 1) ** g - 0.5) * c + 0.5 + u(-aug["brightness"], aug["brightness"])[:, None, None, None])
     return x.clamp(0, 1)
+
+
+def center_view(x, ctx=1.0):
+    """The central 1 / ctx window of context crops, at S / ctx px: the usual crop (validation, inference)."""
+    if ctx == 1.0:
+        return x
+    b = x.shape[0]
+    theta = torch.tensor([[1 / ctx, 0, 0], [0, 1 / ctx, 0]], device=x.device, dtype=x.dtype).expand(b, 2, 3)
+    out = round(x.shape[-1] / ctx)
+    return F.grid_sample(x, F.affine_grid(theta, (b, x.shape[1], out, out), align_corners=False),
+                         mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
+def slice_window(x, depth, jitter=0):
+    """(B, D, S, S) -> (B, depth, S, S): the central `depth` slices, shifted by up to +-jitter (train)."""
+    if not depth or depth >= x.shape[1]:
+        return x
+    start = (x.shape[1] - depth) // 2
+    if not jitter:
+        return x[:, start:start + depth]
+    off = torch.randint(-jitter, jitter + 1, (x.shape[0],), device=x.device).clamp(-start, x.shape[1] - depth - start)
+    idx = (start + off)[:, None] + torch.arange(depth, device=x.device)
+    return torch.gather(x, 1, idx[:, :, None, None].expand(-1, -1, *x.shape[2:]))
+
+
+def mix_batch(x, y, rid, mixup=0.0, cutmix=0.0, alpha=0.4):
+    """Mixup / CutMix between crops of the same finding (rid), soft targets mixed alike."""
+    r = np.random.rand()
+    if r >= mixup + cutmix:
+        return x, y
+    perm = torch.arange(len(rid), device=x.device)
+    for k in rid.unique():
+        i = torch.nonzero(rid == k).flatten()
+        perm[i] = i[torch.randperm(len(i), device=x.device)]
+    lam = float(np.random.beta(alpha, alpha))
+    if r < mixup:
+        return lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm]
+    s = x.shape[-1]
+    h = int(round(s * np.sqrt(1 - lam)))
+    cy, cx = np.random.randint(s), np.random.randint(s)
+    y0, y1, x0, x1 = max(cy - h // 2, 0), min(cy + h // 2, s), max(cx - h // 2, 0), min(cx + h // 2, s)
+    x = x.clone()
+    x[..., y0:y1, x0:x1] = x[perm][..., y0:y1, x0:x1]
+    lam = 1 - (y1 - y0) * (x1 - x0) / (s * s)
+    return x, lam * y + (1 - lam) * y[perm]
+
+
+def model_input(b, device, args, train):
+    """Batch crops -> model input: slice window, context window (+ augmentation when training)."""
+    x = b["x"].to(device, non_blocking=True).float() / 255
+    ctx, depth = getattr(args, "ctx", 1.0) or 1.0, getattr(args, "depth_out", 0)
+    x = slice_window(x, depth, getattr(args, "slice_jitter", 0) if train else 0)
+    if train:
+        return gpu_augment(x, args.augmentations, ctx, getattr(args, "crop_jitter", 0.0))
+    return center_view(x, ctx)
 
 
 # -------------------------------------------------------------------- model
@@ -136,7 +233,7 @@ class Crop25D(nn.Module):
                  drop_path=0.1, head="lstm", fusion="late", depth=None):
         super().__init__()
         kw = {"drop_path_rate": drop_path} if drop_path else {}
-        if img_size and any(k in backbone for k in ("maxvit", "coatnet", "maxxvit", "tiny_vit", "efficientvit_m")):
+        if img_size and any(k in backbone for k in ("maxvit", "coatnet", "maxxvit", "tiny_vit", "efficientvit_m", "vit_")):
             kw["img_size"] = img_size
         if fusion == "early":
             head = "linear"                  # one 2D image per crop: nothing to aggregate
@@ -304,11 +401,11 @@ def study_auc(pred, studies):
 
 
 @torch.no_grad()
-def predict(model, loader, ds, device, amp=True):
+def predict(model, loader, ds, device, amp=True, args=None):
     model.eval()
     rows = []
     for b in loader:
-        x = b["x"].to(device, non_blocking=True).float() / 255
+        x = model_input(b, device, args, train=False)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             p = torch.sigmoid(model(x, b["roi"].to(device), b["plane"].to(device)).float())
         rows += list(zip(b["idx"].tolist(), p.cpu().tolist()))
@@ -320,7 +417,7 @@ def predict(model, loader, ds, device, amp=True):
                          "p": [rows[i] for i in sorted(rows)]})
 
 
-def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
+def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=None):
     device = ctx.device
     log = print if ctx.is_main else (lambda *a, **k: None)
     m = unwrap_model(model)
@@ -338,18 +435,42 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
         if sampler is not None:
             sampler.set_epoch(epoch)
         losses = []
+        mil_it = iter(mil_dl) if mil_dl is not None else None
         for b in train_dl:
-            x = gpu_augment(b["x"].to(device, non_blocking=True).float() / 255, args.augmentations)
+            x = model_input(b, device, args, train=True)
+            roi, y = b["roi"].to(device), b["y"].to(device)
+            x, y = mix_batch(x, y, roi, getattr(args, "mixup", 0.0), getattr(args, "cutmix", 0.0), getattr(args, "mix_alpha", 0.4))
+            plane, n = b["plane"].to(device), len(y)
+            if mil_it is not None:
+                # MIL bags (PairDataset) ride in the same forward pass: medial crops, then lateral crops.
+                try:
+                    mb = next(mil_it)
+                except StopIteration:
+                    mil_it = iter(mil_dl)
+                    mb = next(mil_it)
+                k = mb["x"].shape[0]
+                mx = model_input({"x": mb["x"].flatten(0, 1)}, device, args, train=True)      # (2k, D, S, S): pairs interleaved
+                order = torch.cat([torch.arange(0, 2 * k, 2), torch.arange(1, 2 * k, 2)]).to(device)
+                x = torch.cat([x, mx[order]])
+                roi = torch.cat([roi, mb["roi"][:, 0].to(device), mb["roi"][:, 1].to(device)])
+                plane = torch.cat([plane, mb["plane"].to(device).repeat(2)])
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logit = model(x, b["roi"].to(device), b["plane"].to(device))
-            loss = F.binary_cross_entropy_with_logits(logit.float(), b["y"].to(device))
+                logit = model(x, roi, plane)
+            w = b["w"].to(device)                                   # extra-data (OAI) items can be down-weighted
+            loss = (F.binary_cross_entropy_with_logits(logit[:n].float(), y, reduction="none") * w).sum() / w.sum()
+            if mil_it is not None:
+                bag = torch.maximum(logit[n:n + k], logit[n + k:]).float()        # max-instance MIL
+                loss = loss + args.mil_weight * F.binary_cross_entropy_with_logits(bag, torch.ones_like(bag))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             opt.step()
             sched.step()
             losses.append(float(loss.detach()))
-        pred = predict(m, val_dl, val_ds, device)
+        if len(val_ds) == 0:              # pretraining on extra data only: nothing of ours to score
+            log(f"epoch {epoch + 1}  loss {all_reduce_mean({'l': float(np.mean(losses))}, device)['l']:.4f}  ({time.time() - t0:.0f}s)")
+            continue
+        pred = predict(m, val_dl, val_ds, device, args=args)
         tab, study_tab = study_auc(pred, studies)
         loss = all_reduce_mean({"l": float(np.mean(losses))}, device)["l"]
         log(f"epoch {epoch + 1}  loss {loss:.4f}  gt {tab["gt"].mean():.4f}  hold {tab["hold"].mean():.4f}  "
@@ -362,4 +483,4 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
             tab.to_csv(os.path.join(args.output_dir, "val_table.csv"))
     if ctx.is_main:
         torch.save(m.state_dict(), os.path.join(args.output_dir, "ckpt_final.pt"))
-    return tab
+    return tab if len(val_ds) else pd.DataFrame({"gt": [np.nan], "hold": [np.nan]})
