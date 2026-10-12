@@ -26,7 +26,7 @@ def main():
     from infer.side import predict_sides
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data", required=True, choices=["skm", "mrnet"])
+    p.add_argument("--data", required=True, choices=["skm", "mrnet", "fastmri"])
     a = p.parse_args()
     d = os.path.join(OUTPUT_FOLDER, a.data)
     s = pd.read_csv(os.path.join(d, "series.csv"))

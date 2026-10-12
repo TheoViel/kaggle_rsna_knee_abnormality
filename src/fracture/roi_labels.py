@@ -39,6 +39,10 @@ ACUITY_VERSIONS = {"v1": {"acute": 1.0, "unk": 0.75, "insufficiency": 0.5, "old"
 ACUITY = ACUITY_VERSIONS["v2"]
 
 
+OUTSIDE = False          # --outside: map locations outside every box to the nearest crop(s), at half value
+FIBULA = False           # --fibula: the ninth crop (fracture.fibula) takes fibular-head / fibula fractures
+
+
 def rois(loc):
     """(ROI list, factor) for one reported location."""
     s, r = loc["structure"], loc["region"]
@@ -52,9 +56,23 @@ def rois(loc):
         return SIDE[r], 1.0
     if s == "distal femur (other)" and r == "medial":
         return ["MCL"], 1.0
+    if FIBULA and (s == "fibular head" or ("fibula" in loc.get("detail", "").lower() and r in ("lateral", "unk"))):
+        return ["Fibula"], 1.0
     if s == "fibular head":               # at the lower edge of the coronal lateral OA crop only
         return ["Lateral OA"], 0.5
+    if OUTSIDE:   # outside every box: the nearest crop(s), where secondary signs (edema, effusion) can show
+        if s in ("other", "distal femur (other)") and r == "lateral":   # fibula (level unknown), lateral femur
+            return ["Lateral OA"], 0.5
+        if s == "proximal tibia (other)" and r == "anterior":           # tibial tuberosity region
+            return ["PF OA"], 0.5
+        if s == "proximal tibia (other)":                                # side unknown
+            return SIDE["medial"] + SIDE["lateral"], 0.5
     return [], 0.0
+
+
+def unknown_rois():
+    """--outside: a fracture with no location at all -> both compartments and PF, at half value."""
+    return SIDE["medial"] + SIDE["lateral"] + ["PF OA"], 0.5
 
 
 def main():
@@ -62,15 +80,22 @@ def main():
 
     global ACUITY
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    global OUTSIDE, FIBULA
     ap.add_argument("--version", default="v2", choices=list(ACUITY_VERSIONS))
+    ap.add_argument("--neg_zero", action="store_true", help="studies outside the extraction (Claude < 0.3): 0, not the Claude label")
+    ap.add_argument("--outside", action="store_true", help="map locations outside every box to the nearest crop(s) (OUTSIDE)")
+    ap.add_argument("--fibula", action="store_true", help="add the fibular-head ROI (FIBULA): 9 per-ROI targets")
     a = ap.parse_args()
     ACUITY = ACUITY_VERSIONS[a.version]
-    suffix = "" if a.version == "v1" else f"_{a.version}"
+    OUTSIDE, FIBULA = a.outside, a.fibula
+    suffix = ("" if a.version == "v1" else f"_{a.version}") + ("_z" if a.neg_zero else "") + ("_o" if a.outside else "") + ("_fib" if a.fibula else "")
     rows = json.load(open(os.path.join(LOC, "fracture_locations.json")))["studies"]
     claude = pd.read_csv(CLAUDE_LABELS_CSV).set_index("StudyInstanceUID")["Fracture"]
-    cols = [f"{c}|fracture" for c in ROI_CLASSES]
-    out = pd.DataFrame(np.repeat(claude.values[:, None], len(cols), 1), index=claude.index, columns=cols)
-    out["Fracture"] = claude
+    roi_classes = ROI_CLASSES + (["Fibula"] if FIBULA else [])
+    cols = [f"{c}|fracture" for c in roi_classes]
+    base = claude * 0.0 if a.neg_zero else claude
+    out = pd.DataFrame(np.repeat(base.values[:, None], len(cols), 1), index=claude.index, columns=cols)
+    out["Fracture"] = base
     n_mapped = n_unmapped = 0
     for r in rows:
         uid = r["StudyInstanceUID"]
@@ -78,11 +103,14 @@ def main():
             out.loc[uid, cols] = 0.0
             out.loc[uid, "Fracture"] = 0.0
             continue
-        t = dict.fromkeys(ROI_CLASSES, 0.0)
+        t = dict.fromkeys(roi_classes, 0.0)
         hit = False
-        if isinstance(r["locations"], list):
-            for loc in r["locations"]:
-                rs, f = rois(loc)
+        locs = r["locations"]
+        if OUTSIDE and locs == "unk":
+            locs = [dict(structure="unknown", region="unk", certainty="possible" if r["fracture"] == "possible" else "definite")]
+        if isinstance(locs, list):
+            for loc in locs:
+                rs, f = unknown_rois() if loc["structure"] == "unknown" else rois(loc)
                 v = CERTAINTY[loc["certainty"]] * ACUITY.get(r["acuity"] or "unk", 0.75) * f
                 for c in rs:
                     t[c] = max(t[c], v)
@@ -91,7 +119,7 @@ def main():
             * ACUITY.get(r["acuity"] or "unk", 0.75)
         out.loc[uid, "Fracture"] = study
         if hit:
-            out.loc[uid, cols] = [t[c] for c in ROI_CLASSES]
+            out.loc[uid, cols] = [t[c] for c in roi_classes]
             n_mapped += 1
         else:
             out.loc[uid, cols] = np.nan

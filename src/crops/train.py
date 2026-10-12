@@ -59,6 +59,10 @@ GROUPS.update({
     "all_abn": list(ROI_CLASSES) + [f"{c}|abnormal" for c in ROI_CLASSES],
     # Fracture read from the ROI crops, one target per ROI (fracture.roi_labels); study score = max over ROIs.
     "fracture_roi": [f"{c}|fracture" for c in ROI_CLASSES],
+    # + the fibular-head crop (crop sets f9_*, fracture.fibula; labels fracture.roi_labels --fibula)
+    "fracture_roi9": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"]],
+    # The "all" model + per-ROI fracture targets (labels pl:pl_round2_fracv1): fracture without a separate model.
+    "all_frac": list(ROI_CLASSES) + [f"{c}|fracture" for c in ROI_CLASSES],
 })
 CAPSULE_FINDINGS = ("Effusion", "Synovitis", "Contusion", "Fracture")      # findings read from the capsule crop
 
@@ -67,6 +71,8 @@ def crop_index(c, single=False):
     """Index of a finding's crop in a crop set: its ROI, or the single capsule crop."""
     if "|" in c:                      # MOAKS auxiliary target: the crop of its ROI
         c = c.split("|")[0]
+    if c == "Fibula":                 # ninth crop of the f9_* crop sets (fracture.fibula)
+        return len(ROI_CLASSES)
     return 0 if single or c in CAPSULE_FINDINGS else ROI_CLASSES.index(c)
 PLANES = ["Sagittal", "Coronal", "Axial"]
 
@@ -86,14 +92,16 @@ def load_crops(names):
 class CropDataset(Dataset):
     """(series, ROI) samples of one group, with soft targets."""
 
-    def __init__(self, crops, info, classes, targets):
+    def __init__(self, crops, info, classes, targets, aux_targets=None):
         self.crops = crops
         rows = []
         # Single-crop sets (one union / capsule crop per series): every finding reads crop 0.
         single = all(a.shape[1] == 1 for a in crops.values())
         for i, c in enumerate(classes):
             # roi: which crop of the series; rid: the finding's embedding row (its index in the group).
-            rows.append(info.assign(roi=crop_index(c, single), rid=i, cls=c, target=info.StudyInstanceUID.map(targets[c])))
+            rows.append(info.assign(roi=crop_index(c, single), rid=i, cls=c, target=info.StudyInstanceUID.map(targets[c]),
+                                    # auxiliary target of the same crop (args.aux), NaN = none
+                                    target2=info.StudyInstanceUID.map(aux_targets[c]) if aux_targets and c in aux_targets else np.nan))
         self.items = pd.concat(rows, ignore_index=True).dropna(subset=["target"]).reset_index(drop=True)
         if "w" not in self.items:
             self.items["w"] = 1.0
@@ -106,7 +114,8 @@ class CropDataset(Dataset):
         return {"x": torch.from_numpy(np.array(self.crops[r.src][r.row, r.roi])),   # D S S uint8
                 "roi": torch.tensor(r.rid), "plane": torch.tensor(PLANES.index(r.Anatomical_Plane)),
                 "y": torch.tensor(float(r.target), dtype=torch.float32), "idx": torch.tensor(i),
-                "w": torch.tensor(float(r.w), dtype=torch.float32)}
+                "w": torch.tensor(float(r.w), dtype=torch.float32),
+                "y2": torch.tensor(float(r.target2), dtype=torch.float32)}
 
 
 class PairDataset(Dataset):
@@ -232,7 +241,7 @@ class Crop25D(nn.Module):
     """
 
     def __init__(self, backbone, n_rois, pretrained=True, img_size=None, hidden=256, dropout=0.2,
-                 drop_path=0.1, head="lstm", fusion="late", depth=None):
+                 drop_path=0.1, head="lstm", fusion="late", depth=None, aux=False):
         super().__init__()
         kw = {"drop_path_rate": drop_path} if drop_path else {}
         if img_size and any(k in backbone for k in ("maxvit", "coatnet", "maxxvit", "tiny_vit", "efficientvit_m", "vit_")):
@@ -276,6 +285,8 @@ class Crop25D(nn.Module):
             self.attn = nn.Sequential(nn.Linear(d, d // 2), nn.Tanh(), nn.Linear(d // 2, 1))
         self.drop = nn.Dropout(dropout)
         self.fc = nn.Linear(d, 1)
+        # Auxiliary output (args.aux, e.g. "fracture"): a second logit from the same pass, "is there <aux> in this ROI".
+        self.fc_aux = nn.Linear(d, 1) if aux else None
         cfg = self.encoder.pretrained_cfg
         self.register_buffer("mean", torch.tensor(cfg.get("mean", (0.485, 0.456, 0.406)))[None, :, None, None])
         self.register_buffer("std", torch.tensor(cfg.get("std", (0.229, 0.224, 0.225)))[None, :, None, None])
@@ -301,9 +312,13 @@ class Crop25D(nn.Module):
         x = torch.cat([prev, nxt, x[:, :, 2 * f:]], 2).reshape(nd, *x.shape[2:])
         return (x,) + tuple(inp[1:])
 
-    def forward(self, x, roi, plane):
-        """x (B, D, S, S) float in [0, 1] -> logits (B,)."""
-        return self.fc(self.drop(self.embed(x, roi, plane))).squeeze(-1)
+    def forward(self, x, roi, plane, both=False):
+        """x (B, D, S, S) float in [0, 1] -> logits (B,); both=True: (B, 2) with the auxiliary logit."""
+        e = self.drop(self.embed(x, roi, plane))
+        main = self.fc(e).squeeze(-1)
+        if both:
+            return torch.stack([main, self.fc_aux(e).squeeze(-1)], -1)
+        return main
 
     def embed(self, x, roi, plane):
         """x (B, D, S, S) float in [0, 1] -> the crop's vector (B, d), the input of the final layer."""
@@ -378,7 +393,7 @@ def build_model(a, n_rois, pretrained=False):
     return Crop25D(a["backbone"], n_rois, pretrained=pretrained, img_size=a.get("img_size") or None,
                    hidden=a.get("hidden", 256), dropout=a.get("dropout", 0.2) if pretrained else 0.0,
                    drop_path=a.get("drop_path", 0.1) if pretrained else 0.0, head=a.get("head", "lstm"),
-                   fusion=a.get("fusion", "late"), depth=z.get("depth", 12))
+                   fusion=a.get("fusion", "late"), depth=z.get("depth", 12), aux=bool(a.get("aux")))
 
 
 # ---------------------------------------------------------------- scoring
@@ -390,12 +405,14 @@ def finding_of(sub):
     return next((c for c in CLASSES if c.lower() == sub.lower()), None)
 
 
-def study_auc(pred, studies):
+def study_auc(pred, studies, aux=None):
     """pred: rows (StudyInstanceUID, cls, p) per sample -> per-finding AUCs (gt, hold) and study table."""
     from sklearn.metrics import roc_auc_score
 
     st = studies.set_index("StudyInstanceUID")
     tab = pred.groupby(["StudyInstanceUID", "cls"]).p.mean().unstack()
+    if aux is not None and "p_aux" in pred:       # auxiliary per-ROI output: study score = max over ROIs
+        tab[aux] = pred.groupby(["StudyInstanceUID", "cls"]).p_aux.mean().unstack().max(axis=1)
     # Per-ROI sub-targets of a study finding ("<ROI>|fracture"): the study score is the max over ROIs.
     for f in sorted({c.split("|")[1] for c in tab.columns if "|" in c}):
         F = finding_of(f)
@@ -419,17 +436,23 @@ def study_auc(pred, studies):
 def predict(model, loader, ds, device, amp=True, args=None):
     model.eval()
     rows = []
+    aux = bool(getattr(args, "aux", "")) if args is not None else False
     for b in loader:
         x = model_input(b, device, args, train=False)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-            p = torch.sigmoid(model(x, b["roi"].to(device), b["plane"].to(device)).float())
+            p = torch.sigmoid(model(x, b["roi"].to(device), b["plane"].to(device), **({"both": True} if aux else {})).float())
         rows += list(zip(b["idx"].tolist(), p.cpu().tolist()))
     model.train()
     rows = dict(all_gather_lists(rows))
     it = ds.items.iloc[sorted(rows)]
-    return pd.DataFrame({"StudyInstanceUID": it.StudyInstanceUID.values, "SeriesInstanceUID": it.SeriesInstanceUID.values,
-                         "cls": it.cls.values, "plane": it.Anatomical_Plane.values,
-                         "p": [rows[i] for i in sorted(rows)]})
+    out = pd.DataFrame({"StudyInstanceUID": it.StudyInstanceUID.values, "SeriesInstanceUID": it.SeriesInstanceUID.values,
+                        "cls": it.cls.values, "plane": it.Anatomical_Plane.values})
+    if aux:
+        out["p"] = [rows[i][0] for i in sorted(rows)]
+        out["p_aux"] = [rows[i][1] for i in sorted(rows)]
+    else:
+        out["p"] = [rows[i] for i in sorted(rows)]
+    return out
 
 
 def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=None):
@@ -469,10 +492,20 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=Non
                 x = torch.cat([x, mx[order]])
                 roi = torch.cat([roi, mb["roi"][:, 0].to(device), mb["roi"][:, 1].to(device)])
                 plane = torch.cat([plane, mb["plane"].to(device).repeat(2)])
+            aux = bool(getattr(args, "aux", ""))
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                logit = model(x, roi, plane)
+                logit = model(x, roi, plane, **({"both": True} if aux else {}))
+            if aux:
+                logit, logit2 = logit[:, 0], logit[:, 1]
             w = b["w"].to(device)                                   # extra-data (OAI) items can be down-weighted
             loss = (F.binary_cross_entropy_with_logits(logit[:n].float(), y, reduction="none") * w).sum() / w.sum()
+            if aux:
+                # Auxiliary target of each crop; items without one (NaN) are masked, and the masked sum keeps the
+                # auxiliary head in every rank's graph (DDP).
+                y2 = b["y2"].to(device)
+                m2 = (~torch.isnan(y2)).float()
+                l2 = F.binary_cross_entropy_with_logits(logit2[:n].float(), torch.nan_to_num(y2), reduction="none")
+                loss = loss + args.aux_weight * (l2 * m2).sum() / m2.sum().clamp(min=1.0)
             if mil_it is not None:
                 bag = torch.maximum(logit[n:n + k], logit[n + k:]).float()        # max-instance MIL
                 loss = loss + args.mil_weight * F.binary_cross_entropy_with_logits(bag, torch.ones_like(bag))
@@ -486,7 +519,7 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=Non
             log(f"epoch {epoch + 1}  loss {all_reduce_mean({'l': float(np.mean(losses))}, device)['l']:.4f}  ({time.time() - t0:.0f}s)")
             continue
         pred = predict(m, val_dl, val_ds, device, args=args)
-        tab, study_tab = study_auc(pred, studies)
+        tab, study_tab = study_auc(pred, studies, aux=finding_of(args.aux) if getattr(args, "aux", "") else None)
         loss = all_reduce_mean({"l": float(np.mean(losses))}, device)["l"]
         log(f"epoch {epoch + 1}  loss {loss:.4f}  gt {tab["gt"].mean():.4f}  hold {tab["hold"].mean():.4f}  "
             + "  ".join(f"{c[:10]} {r["gt"]:.3f}/{r["hold"]:.3f}" for c, r in tab.iterrows()) + f"  ({time.time() - t0:.0f}s)")

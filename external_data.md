@@ -389,7 +389,7 @@ Fullfits trained for later use: `mk89` seeds 1–2 (2026-10-11/119, /121), `mk90
   - Never modify submitted folders (`dataset_1`, `2`, `4`, `5`, `2_moaks`). Do not upload or submit without the user's go-ahead.
 - **Tried in 6.6, no gain:** "abnormal" auxiliary target, meniscus MIL, axial MRNet crops.
 - **Done overnight (6.7):** seed ensembles (neutral on the 58 for ACL / MCL; OA: lower on the 58, higher on the holdout), ACL MOAKS + MRNet (no gain), Baker's MOAKS (no gain), menisci MOAKS (adopted), OA on PL round 3 (no gain).
-- **Leaderboard:** `dataset_2_moaks_mrnet` (ACL with MRNet + MCL with MRNet pseudo-labels) scored +0.0001 over `dataset_2_moaks` on the public LB. Next: `dataset_2_moaks_mrnet_men`; not submitted: `_ext`.
+- **Leaderboard:** `dataset_2_moaks_mrnet` (ACL with MRNet + MCL with MRNet pseudo-labels) scored +0.0001 over `dataset_2_moaks` on the public LB. `dataset_2_moaks_mrnet_men` (MOAKS + CAFormer menisci) scored +0.0001 over `dataset_2_moaks_mrnet`. Next: `dataset_2_moaks_mrnet_men_frac`; not submitted: `_ext`.
 
 ## 7. Files
 

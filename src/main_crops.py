@@ -41,6 +41,9 @@ DEFAULTS = {
     # Multiple-instance meniscus bags (crops.train.PairDataset): series of a crop set whose exam has a tear
     # of unknown side (--mil_labels csv, StudyInstanceUID + --mil_col == 1); loss on max(medial, lateral).
     "mil_crops": "", "mil_labels": "", "mil_col": "mrnet_meniscus", "mil_weight": 1.0, "mil_bs": 4,
+    # Auxiliary per-ROI output (crops.train.Crop25D.fc_aux): e.g. --aux fracture --aux_labels frac_roi reads
+    # output/crops/frac_roi.csv columns "<ROI>|fracture"; the study score of the finding = max over ROIs.
+    "aux": "", "aux_labels": "", "aux_weight": 1.0,
     "ctx": 1.0, "crop_jitter": 0.0, "depth_out": 0, "slice_jitter": 0, "mixup": 0.0, "cutmix": 0.0, "mix_alpha": 0.4,
     "augmentations": {"rot_deg": 15.0, "scale_range": (0.85, 1.15), "shift": 0.08,
                       "gamma": 0.3, "contrast": 0.25, "brightness": 0.1},
@@ -120,10 +123,30 @@ def main():
         lab = pd.read_csv(args.extra_labels).set_index("StudyInstanceUID")
         for c in classes:
             targets[c] = pd.concat([targets[c], lab[c]]) if c in lab else targets[c]
+    aux_t = None
+    if args.aux:
+        assert not args.mixup and not args.cutmix and not args.mil_crops, "aux: no mixup / cutmix / MIL"
+        al = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{args.aux_labels}.csv")).set_index("StudyInstanceUID")
+        aux_t = {c: al[f"{c}|{args.aux}"] for c in classes if f"{c}|{args.aux}" in al}
     if args.fullfit:
         # Fullfit (submission models): every study is trained on. The 58 radiologist studies
         # take their radiologist labels; every other study keeps the chosen soft labels.
         st_ = studies.set_index("StudyInstanceUID")
+        # Per-ROI sub-targets of a study finding ("<ROI>|fracture"): the radiologist study label decides on the 58.
+        # Negative -> every ROI 0; positive with no positive ROI target (the report gives no usable location) -> NaN.
+        subs = {c: finding_of(c.split("|")[1]) for c in classes if "|" in c}
+        subs = {c: F for c, F in subs.items() if F is not None and f"gt_{F}" in st_}
+        for F in set(subs.values()):
+            gt = st_[f"gt_{F}"].dropna()
+            cols = [c for c, f in subs.items() if f == F]
+            roi_max = pd.concat([targets[c].reindex(gt.index) for c in cols], axis=1).max(axis=1)
+            neg, unk = gt.index[gt < 0.5], gt.index[(gt >= 0.5) & ~(roi_max >= 0.5)]
+            for c in cols:
+                t = targets[c].reindex(targets[c].index.union(gt.index))
+                t.loc[neg], t.loc[unk] = 0.0, np.nan
+                targets[c] = t
+            if ctx.is_main:
+                print(f"- fullfit {F}: radiologist labels on the 58 -> {len(neg)} negatives, {len(unk)} positives without a location (NaN)")
         for c in classes:
             if f"gt_{c}" not in st_:          # no radiologist labels (e.g. MOAKS targets): unchanged
                 continue
@@ -131,12 +154,12 @@ def main():
             t = targets[c].reindex(idx)
             gt = st_[f"gt_{c}"].reindex(idx)
             targets[c] = t.where(gt.isna(), gt)
-        train_ds = CropDataset(crops, info, classes, targets)
+        train_ds = CropDataset(crops, info, classes, targets, aux_t)
     else:
-        train_ds = CropDataset(crops, info[~val_mask], classes, targets)
+        train_ds = CropDataset(crops, info[~val_mask], classes, targets, aux_t)
     if extra is not None:
         tr_info = extra if args.extra_only else pd.concat([info if args.fullfit else info[~val_mask], extra], ignore_index=True)
-        train_ds = CropDataset(crops, tr_info, classes, targets)
+        train_ds = CropDataset(crops, tr_info, classes, targets, aux_t)
         train_ds.items["w"] = np.where(train_ds.items.src.isin(args.extra_crops.split(",")), args.extra_weight, 1.0)
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
     val_t = training_targets("claude", studies, classes)

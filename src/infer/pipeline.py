@@ -235,7 +235,7 @@ def _padded(x, n):
 
 class Models:
     def __init__(self, weights, recipe, device):
-        from crops.train import GROUPS, PLANES, build_model as build_crop_model, crop_index
+        from crops.train import GROUPS, PLANES, build_model as build_crop_model, crop_index, finding_of
         from roi.train import build_model
         from side_cls import SideNet
 
@@ -267,11 +267,17 @@ class Models:
             net = net.to(device).eval()
             if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
                 net = net.to(memory_format=torch.channels_last)
-            used = [c for c in group if c in recipe and any(x.split("@")[0] == m for x in recipe[c]["models"])]
+            takes = {f for f, r in recipe.items() if any(x.split("@")[0] == m for x in r["models"])}   # findings from it
+            aux = finding_of(a["aux"]) if a.get("aux") else None
+            if aux in takes:          # auxiliary per-ROI output (e.g. fracture): needs every ROI crop of the model
+                used = list(group)
+            else:                     # its own findings, and per-ROI sub-targets ("<ROI>|fracture") of findings taken from it
+                used = [c for c in group if c in takes or ("|" in c and finding_of(c.split("|")[1]) in takes)]
             z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
             z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
-                                   "compartment", "oa_midline", "union") if k in z}
+                                   "compartment", "oa_midline", "union", "fibula") if k in z}
             self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
+                                   aux=a["aux"] if a.get("aux") else None,
                                    planes_all=PLANES,
                                    rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
 
@@ -368,7 +374,20 @@ def process_chunk(studies, models, timer):
         cap, cap_up = kw.pop("capsule", None), kw.pop("capsule_up", None)
         compartment, midline = kw.pop("compartment", None), kw.pop("oa_midline", "")
         union = [c for c in kw.pop("union", "").split(",") if c]
-        if cap is not None:               # effusion / synovitis: one capsule crop around the ROI union
+        fibula = kw.pop("fibula", False)
+        if fibula:                        # 9 ROIs: + the fibular head, derived from the series' boxes (fracture.fibula)
+            from fracture.fibula import fibula_box
+
+            series_boxes = {}
+            for s in crop_rows:
+                bx = dict(by_series.get(s["SeriesInstanceUID"], {}))
+                if s["plane"] in ("Sagittal", "Coronal"):
+                    fb = fibula_box(bx, s["plane"], s["rows"], s["cols"], s["n_slices"])
+                    if fb is not None:
+                        bx["Fibula"] = fb
+                series_boxes[s["SeriesInstanceUID"]] = bx
+            kw.update(classes=ROI_CLASSES + ["Fibula"])
+        elif cap is not None:               # effusion / synovitis: one capsule crop around the ROI union
             from crops.prepare import capsule_boxes
 
             shape = {s["SeriesInstanceUID"]: (s["rows"], s["cols"]) for s in crop_rows}
@@ -416,7 +435,12 @@ def process_chunk(studies, models, timer):
             j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
             x = _padded(x_all[j, roi], CROP_BATCH).float() / 255
             with torch.autocast(**amp):
-                p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH)).float())
+                p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH),
+                                           **({"both": True} if m["aux"] else {})).float())
+            if m["aux"]:              # (main, auxiliary) per item; the auxiliary row is "<finding>|<aux>"
+                p, p2 = p[:, 0], p[:, 1]
+                out += [(m["name"], st, f"{c}|{m['aux']}", m["planes_all"][pl_], float(v))
+                        for (_, _, _, pl_, st, c), v in zip(part, p2[:len(part)].tolist())]
             out += [(m["name"], st, c, m["planes_all"][pl_], float(v))
                     for (_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist())]
         dt = time.time() - t
@@ -424,6 +448,12 @@ def process_chunk(studies, models, timer):
         timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
     rows = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "plane", "p"])
     preds = rows.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
+    # Per-ROI sub-targets / auxiliary outputs ("<ROI>|fracture") -> the study finding ("Fracture"): max over ROIs.
+    from crops.train import finding_of
+    sub = preds[preds.cls.str.contains("|", regex=False)]
+    if len(sub):
+        sub = sub.assign(cls=sub.cls.str.split("|").str[1].map(finding_of)).dropna(subset=["cls"])
+        preds = pd.concat([preds, sub.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.max()], ignore_index=True)
     for ref, base, planes in models.restricted:            # "name@planes" recipe entries
         sub = rows[(rows.model == base) & rows.plane.isin(planes)]
         preds = pd.concat([preds, sub.groupby(["StudyInstanceUID", "cls"], as_index=False).p.mean().assign(model=ref)],
