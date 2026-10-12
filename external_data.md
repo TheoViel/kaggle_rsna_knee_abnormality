@@ -2,7 +2,7 @@
 
 Status as of 2026-10-11:
 - External data is allowed in the competition.
-- The only external data in a submission so far is MOAKS (OAI) pretraining, in the OA models of `output/dataset_2_moaks`. It was submitted: **public LB up by almost 0.001 over `dataset_2`**, the first external-data change confirmed on the leaderboard.
+- The only external data in a submission so far is MOAKS (OAI) pretraining, in the OA models of `output/dataset_2_moaks`. It was submitted: **public LB up by almost 0.001 over `dataset_2`**, the first external-data change confirmed on the leaderboard. `dataset_2_moaks_mrnet` (+ MRNet for ACL and MCL) then scored +0.0001 over `dataset_2_moaks`.
 
 All commands run from `src/` with `PYTHONPATH=.` and `../.venv/bin/python`; `torchrun` means `../.venv/bin/torchrun --standalone --nproc_per_node=4`. Scores are AUC on the 58 radiologist-labelled studies / holdout (Claude labels), from the non-fullfit validation runs.
 
@@ -347,17 +347,49 @@ Pseudo-labelled MRNet (`labels_pl.csv`, see 6.2) turns the 1,250 clinical exams 
 
 **Packaged** (not uploaded): `output/dataset_2_moaks_mrnet` = `dataset_2_moaks` + ACL with MRNet (`mr85`) + MCL with MRNet pseudo-labels (`pl86`, fullfit 2026-10-11/102), recipe level 0.9588 / 0.9477. `output/dataset_2_moaks_mrnet_ext` = the same + an "all" + OAI v4 + MRNet model (`ext88`, fullfit 2026-10-11/103) used for the medial meniscus and medial OA only. Recipe level: 0.9580–0.9596 / 0.9474–0.9478 depending on the seed pairing, vs 0.9572 / 0.9460. Smoke-tested through `infer.pipeline`.
 
-### 6.6 Next steps
+### 6.6 More MRNet ideas (none adopted)
+
+Recipe-level scores against `dataset_2_moaks_mrnet` (0.9588 / 0.9477 with the seed-0 counterparts; menisci reference seed 1: 0.9585 / 0.9476). Runs `logs/crops_run/2026-10-11/104–114`.
+
+| Idea | Implementation | Recipe macro (58 / holdout) | Verdict |
+|---|---|---|---|
+| **Meniscus MIL**: a tear-positive exam pushes up whichever meniscus looks torn, instead of guessing the side | `main_crops.py --mil_crops mrnet_s1n8 --mil_labels ../output/mrnet/labels.csv` (+ `--mil_weight`, `--mil_bs 4`): `crops.train.PairDataset` bags (both meniscus crops of a series, 898 series / 449 exams) ride in the same forward pass; loss BCE(max(medial, lateral logit), 1). Trained with `labels_graded` (tear-negative exams) | menisci CoAtNet: 0.9582 / 0.9474, 0.9574 / 0.9475 (lat. men. 0.939 / 0.938 vs 0.945 / 0.941) | no gain |
+| **"abnormal" as an auxiliary target** on every ROI crop | group `all_abn` (8 findings + `<ROI>|abnormal`), labels `mrnet.labels --abn --name labels_abn` | "all": 0.9575 / 0.9483, 0.9534 / 0.9480 | no gain on the 58 (MCL, lat. men., Baker's drop); +0.0005 holdout |
+| MIL in the "all" model; abnormal + MIL | as above | 0.9529 / 0.9475; 0.9514 / 0.9481 | worse |
+| **Axial MRNet crops** (no geometry) | `ext.axial_boxes`: per-class ridge regression from the in-plane sagittal / coronal box coordinates to the normalised axial box, fitted on our studies (U-Net boxes → registered axial boxes; CV median IoU 0.44–0.53, 82–95% above 0.3) → `output/mrnet/rois_axial.csv`, crop set `mrnet_s1n8_axial`. Visually mostly right, but the PF crop sometimes misses the patella; axial vs sag / cor prediction agreement on MRNet 0.57–0.68 (ours 0.82–0.93) | MCL + PL + axial, 3 seeds: 0.9579 / 0.9477, 0.9579 / 0.9465, 0.9578 / 0.9479 (MCL 0.988–0.989 vs 0.985–0.995 without) | no gain |
+| PF OA model (`mk90` setup, MOAKS init) + MRNet PL, without / with axial MRNet | `--init ../logs/crops_run/2026-10-11/8` + `labels_pl` | PF OA 0.907 / 0.900 vs 0.923 | worse |
+
+So the MRNet gains are ACL (joint training) and MCL (pseudo-labels); every other way of using it tried so far is neutral or worse.
+
+### 6.7 Overnight round (2026-10-11 night): seeds and combinations
+
+Script `logs/night_queue.sh`, runs `logs/crops_run/2026-10-11/115–138`, recipe-level scores against `dataset_2_moaks_mrnet` (0.9588 / 0.9477; seed-0 counterparts), 58 / holdout.
+
+| Candidate | Seeds | Recipe macro | Verdict |
+|---|---|---|---|
+| **Menisci CoAtNet, MOAKS-pretrained** (own CoAtNet pretraining run 29, then the run 81 setup) | s0 (run 30), s1, s2 | **0.9599 / 0.9478, 0.9591 / 0.9475, 0.9594 / 0.9478**; lat. men. 0.955 / 0.945 / 0.949, med. men. 0.978 / 0.981 / 0.979 | **adopted**: all 3 seeds above both reference seeds (0.9588, 0.9585); as 2-seed ensembles 0.9591 vs 0.9577 |
+| Seed ensembles of the MOAKS OA models (`mk89` × 3, `mk90` × 3) | s0–s2 | 0.9558 / **0.9485**: lat. OA 0.872 / 0.905, PF OA 0.907 / 0.939 (vs 0.878 / 0.900, 0.923 / 0.937) | seed 0 (the submitted one) is a lucky seed on the 58: seeds 1–2 give PF OA 0.897 and lat. OA 0.863 / 0.874. The ensemble is the more honest estimate and is better on the holdout, but the 58 cannot show a gain. Fullfits exist (see below) |
+| ACL: MOAKS pretraining + MRNet w2 | s0–s2 | 0.9588 / 0.9478, 0.9586, 0.9583 | same as MRNet alone: no gain |
+| Seed ensembles of `mr85` (ACL) and `pl86` (MCL), 3 seeds each | | 0.9588 / 0.9480 | neutral (+0.0003 holdout) |
+| Baker's, MOAKS-pretrained | s0, s1 | 0.9583, 0.9588 | no gain |
+| OA models (MOAKS init) on PL round 3 | s0, s1 each | 0.9558–0.9589 | no gain |
+
+Fullfits trained for later use: `mk89` seeds 1–2 (2026-10-11/119, /121), `mk90` seeds 1–2 (/120, /122), `mr85` seeds 1–2 (/131, /133), `pl86` seeds 1–2 (/132, /134), ACL MOAKS + MRNet (/126), menisci MOAKS seed 0 (/139).
+
+**Packaged** (not uploaded):
+- `output/dataset_2_moaks_mrnet_men` (to be submitted) = `dataset_2_moaks_mrnet` with the MOAKS-pretrained menisci model (`mk87`, recipe 0.9599 / 0.9478 alone) plus a CAFormer-S18 menisci model trained with axial crops (`cafax87`, fullfit 2026-10-12/11), read on sagittal + coronal only for the lateral meniscus (`cafax87@Sagittal,Coronal`): recipe **0.9611 / 0.9480**. An intermediate version without the CAFormer was replaced by this one. See its readme.
+- `output/dataset_2_moaks_mrnet_men_oa3` (3-seed ensembles of `mk89` / `mk90` on top of `mk87`, recipe 0.9570 / 0.9486: lower on the 58, higher on the holdout) was deleted; the seed fullfits remain in logs/crops_run/2026-10-11/119–122.
+
+### 6.8 Next steps
 
 - **Candidate packages** (new folders only; submit one at a time to read the leaderboard):
   - `output/dataset_2_moaks_mrnet` = `dataset_2_moaks` + ACL trained with MRNet + MCL trained with MRNet pseudo-labels;
   - `output/dataset_2_moaks_mrnet_ext` = `dataset_2_moaks_mrnet` + external "all" model for the medial meniscus and medial OA (one extra ConvNeXt-tiny at inference).
   - Both are to be submitted together; the difference between them isolates the second "all" model.
   - Never modify submitted folders (`dataset_1`, `2`, `4`, `5`, `2_moaks`). Do not upload or submit without the user's go-ahead.
-- **Untried ideas:**
-  - MRNet "abnormal" as an auxiliary target;
-  - MIL on meniscus-positive exams: loss on max(medial, lateral) instead of a side guess;
-  - MRNet axial crops: they need boxes without geometry, e.g. a U-Net run on axial, or a rule from the sagittal / coronal boxes.
+- **Tried in 6.6, no gain:** "abnormal" auxiliary target, meniscus MIL, axial MRNet crops.
+- **Done overnight (6.7):** seed ensembles (neutral on the 58 for ACL / MCL; OA: lower on the 58, higher on the holdout), ACL MOAKS + MRNet (no gain), Baker's MOAKS (no gain), menisci MOAKS (adopted), OA on PL round 3 (no gain).
+- **Leaderboard:** `dataset_2_moaks_mrnet` (ACL with MRNet + MCL with MRNet pseudo-labels) scored +0.0001 over `dataset_2_moaks` on the public LB. Next: `dataset_2_moaks_mrnet_men`; not submitted: `_ext`.
 
 ## 7. Files
 
@@ -368,10 +400,12 @@ Pseudo-labelled MRNet (`labels_pl.csv`, see 6.2) turns the 1,250 clinical exams 
 | `src/mrnet/{prep,labels}.py` | MRNet pipeline |
 | `src/ext/download.py` | Redivis downloads (SKM-TEA, MRNet) |
 | `src/ext/boxes.py` | Side + U-Net boxes without consensus (SKM-TEA, MRNet) |
+| `src/ext/axial_boxes.py` | Axial boxes without geometry: regression from sagittal / coronal boxes (6.6) |
+| `src/crops/train.py` `PairDataset`, `main_crops.py --mil_*` | Meniscus MIL bags (6.6) |
 | `src/ext/recipe_eval.py` | Recipe-level 58 / holdout scores of `dataset_2_moaks` with swapped models (6.4) |
 | `src/crops/predict.py --crops <set>` | Predictions of trained runs on another crop set (zero-shot checks, pseudo-labels) |
 | `output/{oai,skm,mrnet}/` | Caches, volumes, metadata, boxes, labels |
 | `output/crops/{oai_*,skm_s1n8,mrnet_s1n8}.*` | External crop sets |
-| `output/mrnet/labels_{graded,menpl,mensoft,pl}.csv` | MRNet label variants (6.2) |
+| `output/mrnet/labels_{graded,menpl,mensoft,pl,abn}.csv` | MRNet label variants (6.2, 6.6) |
 | `output/ext/{skm_mrnet_labels_graded,oai4_mrnet_labels}.csv` | Combined label files for training on two external sets at once |
 | `experiments.md` §16 | OAI experiment log, in more detail |

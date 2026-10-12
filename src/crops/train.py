@@ -57,6 +57,8 @@ GROUPS.update({
     "all_moaks": list(ROI_CLASSES) + GROUPS["moaks_aux"],
     # MRNet's exam-level "abnormal" label as an auxiliary target on every ROI crop (mrnet.labels --abn).
     "all_abn": list(ROI_CLASSES) + [f"{c}|abnormal" for c in ROI_CLASSES],
+    # Fracture read from the ROI crops, one target per ROI (fracture.roi_labels); study score = max over ROIs.
+    "fracture_roi": [f"{c}|fracture" for c in ROI_CLASSES],
 })
 CAPSULE_FINDINGS = ("Effusion", "Synovitis", "Contusion", "Fracture")      # findings read from the capsule crop
 
@@ -382,14 +384,27 @@ def build_model(a, n_rois, pretrained=False):
 # ---------------------------------------------------------------- scoring
 
 
+def finding_of(sub):
+    """'fracture' -> 'Fracture' when a sub-target suffix names one of the 12 findings, else None."""
+    from params import CLASSES
+    return next((c for c in CLASSES if c.lower() == sub.lower()), None)
+
+
 def study_auc(pred, studies):
     """pred: rows (StudyInstanceUID, cls, p) per sample -> per-finding AUCs (gt, hold) and study table."""
     from sklearn.metrics import roc_auc_score
 
     st = studies.set_index("StudyInstanceUID")
     tab = pred.groupby(["StudyInstanceUID", "cls"]).p.mean().unstack()
+    # Per-ROI sub-targets of a study finding ("<ROI>|fracture"): the study score is the max over ROIs.
+    for f in sorted({c.split("|")[1] for c in tab.columns if "|" in c}):
+        F = finding_of(f)
+        if F is not None:
+            tab[F] = tab[[c for c in tab.columns if c.endswith("|" + f)]].max(axis=1)
     out = {}
     for c in tab.columns:
+        if f"gt_{c}" not in st:
+            continue
         p = tab[c].dropna()
         gt = st.loc[p.index, f"gt_{c}"]
         g = gt.notna()

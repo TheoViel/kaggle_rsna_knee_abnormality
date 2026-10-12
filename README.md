@@ -275,6 +275,7 @@ Details are in `experiments.md` sections 7–11. Scores are on the 58 radiologis
 - **No intermediate files.** A chunk's caches stay on the GPU. The old staged path wrote ~32 GB of 384 px caches for the test set.
 - **Fewer predictions.** Each crop model only predicts the findings `recipe.json` takes from it, which is 21% fewer FLOPs.
 - **Output.** Per finding, the recipe's models are combined by rank average over the test studies. The 4 findings without an ROI stay at 0.5.
+- **Plane-restricted entries.** A recipe entry `"name@Sagittal,Coronal"` uses model `name` for that finding, averaged over its series of those planes only. Example: a menisci model trained with axial crops, read without its axial series for the lateral meniscus. The model is loaded and run once; the restricted average reuses its per-series outputs, at no extra cost.
 
 The staged modules (`infer.prep` → `infer.side` → `infer.seg` → `infer.classify`) still exist and do the same operations.
 

@@ -19,7 +19,7 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
-from crops.train import GROUPS, CropDataset, PairDataset, build_model, fit, load_crops  # noqa: E402
+from crops.train import GROUPS, CropDataset, PairDataset, build_model, finding_of, fit, load_crops  # noqa: E402
 from knee_cls.data import load_tables, make_splits  # noqa: E402
 from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
@@ -139,7 +139,12 @@ def main():
         train_ds = CropDataset(crops, tr_info, classes, targets)
         train_ds.items["w"] = np.where(train_ds.items.src.isin(args.extra_crops.split(",")), args.extra_weight, 1.0)
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
-    val_ds = CropDataset(crops, info[val_mask], classes, training_targets("claude", studies, classes))
+    val_t = training_targets("claude", studies, classes)
+    for c in classes:                     # "<ROI>|fracture": scored at study level (crops.train.study_auc)
+        F = finding_of(c.split("|")[1]) if "|" in c else None
+        if F is not None:
+            val_t[c] = training_targets("claude", studies, [F])[F]
+    val_ds = CropDataset(crops, info[val_mask], classes, val_t)
     if ctx.is_main:
         if args.fullfit:
             print("-> FULLFIT: validation studies are trained on, validation scores below are leaky")

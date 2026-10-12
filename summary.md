@@ -34,10 +34,11 @@ The last block replaces the 4 non-ROI findings by b1_c1's predictions, the confi
 | `dataset_6` + b1_c1 | **0.993** | **0.994** | 0.975 | **0.937** | 0.978 | **0.903** | **0.905** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.960** | **0.952** |  |
 | `dataset_7` + b1_c1 | **0.993** | **0.994** | 0.975 | **0.937** | 0.983 | 0.901 | **0.914** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.961** | **0.953** |  |
 | `dataset_2_moaks` + b1_c1 (submitted; `dataset_2` with MOAKS-pretrained OA models) | 0.972 | **0.994** | **0.977** | **0.934** | 0.977 | 0.878 | **0.923** | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.956 | 0.950 | `dataset_2` + ~0.001 |
-| `dataset_2_moaks_mrnet` + b1_c1 (`dataset_2_moaks` + ACL with MRNet + MCL with MRNet pseudo-labels) | 0.983 | **0.996** | 0.978 | 0.945 | 0.977 | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.959 | | |
+| `dataset_2_moaks_mrnet` + b1_c1 (submitted; `dataset_2_moaks` + ACL with MRNet + MCL with MRNet pseudo-labels) | 0.983 | **0.996** | 0.978 | 0.945 | 0.977 | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | 0.959 | | `dataset_2_moaks` + 0.0001 |
 | `dataset_2_moaks_mrnet_ext` + b1_c1 (+ OAI/MRNet `all` for med. men. / med. OA) | 0.983 | **0.996** | **0.982** | 0.945 | **0.980** | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.960** | | |
+| `dataset_2_moaks_mrnet_men` + b1_c1 (to be submitted; + MOAKS menisci + CAFormer menisci, lat. men. on sag + cor) | 0.983 | **0.996** | **0.983** | **0.959** | 0.977 | 0.878 | 0.923 | **0.991** | **0.989** | **0.851** | **0.955** | **0.953** | **0.961** | | |
 
-Note: the `dataset_2_moaks_mrnet` and `dataset_2_moaks_mrnet_ext` rows are on a different scale from the rows above: recipe-level evaluation of the validation (non-fullfit) runs (`src/ext/recipe_eval.py`, external_data.md §6.4). On that scale `dataset_2_moaks` scores 0.957 (ACL 0.975, MCL 0.991, med. men. 0.978, lat. men. 0.945, med. OA 0.977, lat. OA 0.878, PF OA 0.923, Baker's 0.991); compare against that. The 12-finding column is left empty.
+Note: the `dataset_2_moaks_mrnet*` rows are on a different scale from the rows above: recipe-level evaluation of the validation (non-fullfit) runs (`src/ext/recipe_eval.py`, external_data.md §6.4). On that scale `dataset_2_moaks` scores 0.957 (ACL 0.975, MCL 0.991, med. men. 0.978, lat. men. 0.945, med. OA 0.977, lat. OA 0.878, PF OA 0.923, Baker's 0.991); compare against that. The 12-finding column is left empty.
 
 What each folder contains:
 

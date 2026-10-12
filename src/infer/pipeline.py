@@ -251,7 +251,10 @@ class Models:
         self.unet.load_state_dict(sd)
         self.unet = self.unet.to(device).eval()
         self.crops = []
-        for m in sorted({m for r in recipe.values() for m in r["models"]}):
+        refs = {m for r in recipe.values() for m in r["models"]}
+        # "name@Plane1,Plane2" entries: (entry, model, planes), averaged in process_chunk
+        self.restricted = [(x, x.split("@")[0], x.split("@")[1].split(",")) for x in sorted(refs) if "@" in x]
+        for m in sorted({x.split("@")[0] for x in refs}):
             d = os.path.join(weights, "crops", m)
             a = json.load(open(os.path.join(d, "args.json")))
             group = GROUPS[a["group"]]
@@ -264,7 +267,7 @@ class Models:
             net = net.to(device).eval()
             if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
                 net = net.to(memory_format=torch.channels_last)
-            used = [c for c in group if c in recipe and m in recipe[c]["models"]]     # findings taken from it
+            used = [c for c in group if c in recipe and any(x.split("@")[0] == m for x in recipe[c]["models"])]
             z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
             z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
                                    "compartment", "oa_midline", "union") if k in z}
@@ -414,12 +417,17 @@ def process_chunk(studies, models, timer):
             x = _padded(x_all[j, roi], CROP_BATCH).float() / 255
             with torch.autocast(**amp):
                 p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH)).float())
-            out += [(m["name"], st, c, float(v)) for (_, _, _, _, st, c), v in zip(part, p[:len(part)].tolist())]
+            out += [(m["name"], st, c, m["planes_all"][pl_], float(v))
+                    for (_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist())]
         dt = time.time() - t
         timer["models"] += dt
         timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
-    preds = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "p"])
-    preds = preds.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
+    rows = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "plane", "p"])
+    preds = rows.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
+    for ref, base, planes in models.restricted:            # "name@planes" recipe entries
+        sub = rows[(rows.model == base) & rows.plane.isin(planes)]
+        preds = pd.concat([preds, sub.groupby(["StudyInstanceUID", "cls"], as_index=False).p.mean().assign(model=ref)],
+                          ignore_index=True)
     series = series.assign(p_right=[s["p_right"] for s in ser],
                            dicom_laterality=[s["dicom_laterality"] for s in ser])
     failed = pd.DataFrame([{k: s.get(k) for k in ["StudyInstanceUID", "SeriesInstanceUID", "plane", "status"]}
@@ -483,7 +491,11 @@ def run_shard(df, weights, recipe, out_dir, workers):
 
 
 def load_recipe(path):
-    """recipe.json -> {finding: {"models": [...], "minus": {"finding": f, "beta": b} or None}}."""
+    """recipe.json -> {finding: {"models": [...], "minus": {"finding": f, "beta": b} or None}}.
+
+    A model entry "name@Plane1,Plane2" uses model `name` for that finding averaged over the series of those
+    planes only (e.g. a model trained with axial crops, read without its axial series for one finding).
+    The model itself is loaded and run once; the restricted average reuses its per-series outputs."""
     with open(path) as f:
         r = json.load(f)
     return {c: (dict(models=v, minus=None) if isinstance(v, list) else dict(models=v["models"], minus=v.get("minus")))
