@@ -25,6 +25,7 @@ dataset_preds*
 models/
 third_party/
 jiwei-code/
+weights_val/
 
 # Extensions
 *.csv
