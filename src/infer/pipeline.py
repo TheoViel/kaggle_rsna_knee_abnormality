@@ -54,6 +54,9 @@ from roi.extract import ROI_CLASSES
 ROI_PLANES = ("Sagittal", "Coronal")
 VOL_DEPTH, VOL_SIZE = 32, 128            # roi.prepare.cache_to_volume
 SIDE_BATCH, UNET_BATCH, CROP_BATCH = 64, 16, 64
+# Whole-joint (capsule) crop models: 24 x 160 px items and one crop per series, so a smaller padded batch (memory on a
+# 16 GB T4: CAFormer-S18 needs 10.7 GB at 64, 2.7 GB at 16).
+CAPSULE_BATCH = 16
 CHUNK = 24                               # studies per GPU chunk
 
 
@@ -277,6 +280,7 @@ class Models:
             z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
                                    "compartment", "oa_midline", "union", "fibula") if k in z}
             self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
+                                   batch=CAPSULE_BATCH if "capsule" in z else CROP_BATCH,
                                    aux=a["aux"] if a.get("aux") else None,
                                    planes_all=PLANES,
                                    rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
@@ -291,9 +295,9 @@ class Models:
             self.side(z((SIDE_BATCH, 4, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
             self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
             for m in self.crops:
-                i = z(CROP_BATCH, dtype=torch.long, device=self.device)
+                i = z(m["batch"], dtype=torch.long, device=self.device)
                 k = json.loads(m["z"])
-                m["net"](z((CROP_BATCH, k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device), i, i)
+                m["net"](z((m["batch"], k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device), i, i)
         torch.cuda.synchronize()
 
 
@@ -430,12 +434,13 @@ def process_chunk(studies, models, timer):
         items = [(j, roi, rid, m["planes_all"].index(s["plane"]), s["StudyInstanceUID"], c)
                  for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
                  for c, (roi, rid) in m["rois"].items() if have[j, roi]]
-        for i in range(0, len(items), CROP_BATCH):
-            part = items[i:i + CROP_BATCH]
+        nb = m["batch"]
+        for i in range(0, len(items), nb):
+            part = items[i:i + nb]
             j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
-            x = _padded(x_all[j, roi], CROP_BATCH).float() / 255
+            x = _padded(x_all[j, roi], nb).float() / 255
             with torch.autocast(**amp):
-                p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH),
+                p = torch.sigmoid(m["net"](x, _padded(rid, nb), _padded(pl, nb),
                                            **({"both": True} if m["aux"] else {})).float())
             if m["aux"]:              # (main, auxiliary) per item; the auxiliary row is "<finding>|<aux>"
                 p, p2 = p[:, 0], p[:, 1]

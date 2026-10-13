@@ -23,6 +23,14 @@ ROI_W = "../logs/roi_run/2026-10-09/1"
 
 
 def main():
+    import argparse
+
+    from oai.labels import visit_dir
+
+    global OAI_DIR
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--visit", default="00", choices=["00", "01", "03"])
+    OAI_DIR = visit_dir(ap.parse_args().visit)
     from infer.classify import axial_boxes
     from infer.seg import consensus, predict_boxes
     from infer.side import predict_sides

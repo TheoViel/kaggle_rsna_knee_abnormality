@@ -46,6 +46,7 @@ GROUPS = {
     "capsule": ["Effusion", "Synovitis"], "effusion": ["Effusion"], "synovitis": ["Synovitis"],
     # Bone findings around the joint, from the same whole-joint crop (experiment).
     "joint4": ["Effusion", "Synovitis", "Contusion", "Fracture"], "bone": ["Contusion", "Fracture"],
+    "contusion_cap": ["Contusion"],                 # whole-joint (capsule) crop, study label
     # Both tibiofemoral compartments from one crop that shows both (single-crop sets).
     "tf": ["Medial OA", "Lateral OA"],
     # MOAKS gradings for multi-task pretraining on OAI ("<ROI>|<feature>", see oai.labels.aux_targets).
@@ -61,6 +62,10 @@ GROUPS.update({
     "fracture_roi": [f"{c}|fracture" for c in ROI_CLASSES],
     # + the fibular-head crop (crop sets f9_*, fracture.fibula; labels fracture.roi_labels --fibula)
     "fracture_roi9": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"]],
+    # Contusion per ROI (fracture.roi_labels --finding contusion), alone or with fracture on the same 9 crops.
+    "contusion_roi9": [f"{c}|contusion" for c in ROI_CLASSES + ["Fibula"]],
+    "contusion_roi": [f"{c}|contusion" for c in ROI_CLASSES],          # 8 ROIs (crop sets without the fibula)
+    "bone_roi9": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"]] + [f"{c}|contusion" for c in ROI_CLASSES + ["Fibula"]],
     # The "all" model + per-ROI fracture targets (labels pl:pl_round2_fracv1): fracture without a separate model.
     "all_frac": list(ROI_CLASSES) + [f"{c}|fracture" for c in ROI_CLASSES],
 })

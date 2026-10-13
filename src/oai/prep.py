@@ -29,6 +29,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from oai.labels import MONTHS, knee_uid, visit_dir
 from params import INPUT_FOLDER, OUTPUT_FOLDER
 
 IMG_ROOT = os.path.join(INPUT_FOLDER, "oai", "images", "baseline", "image03")
@@ -65,8 +66,8 @@ def process(job):
     from roi.prepare import cache_to_volume
 
     torch.set_num_threads(1)
-    path, oai_id, side, seq, cache_dir = job
-    meta = dict(StudyInstanceUID=f"OAI_{oai_id}_{side}", seq=seq, side="R" if side == "RIGHT" else "L",
+    path, oai_id, side, seq, cache_dir, visit = job
+    meta = dict(StudyInstanceUID=knee_uid(oai_id, side, visit), seq=seq, side="R" if side == "RIGHT" else "L",
                 plane=PLANE[seq], Fluid_Sensitive=FLUID[seq])
     try:
         dss = read_tar(path)
@@ -103,15 +104,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--workers", type=int, default=64)
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--visit", default="00", choices=["00", "01", "03"], help="MOAKS visit: baseline, 12 or 24 months")
     a = p.parse_args()
-    idx = pd.read_csv(os.path.join(INPUT_FOLDER, "oai", "images", "baseline_moaks_series.csv"))
+    out_dir = visit_dir(a.visit)
+    img_root = IMG_ROOT if a.visit == "00" else os.path.join(INPUT_FOLDER, "oai", "images", f"m{MONTHS[a.visit]}", "image03")
+    idx = pd.read_csv(os.path.join(INPUT_FOLDER, "oai", "images",
+                                   "baseline_moaks_series.csv" if a.visit == "00" else f"m{MONTHS[a.visit]}_moaks_series.csv"))
     if a.limit:
         idx = idx.head(a.limit)
-    cache_dir = os.path.join(OAI_DIR, "cache_384")
+    cache_dir = os.path.join(out_dir, "cache_384")
     os.makedirs(cache_dir, exist_ok=True)
-    jobs = [(os.path.join(IMG_ROOT, r.image_file.split("submission_60350/")[1]), r.src_subject_id, r.side, r.seq, cache_dir)
+    jobs = [(os.path.join(img_root, r.image_file.split("submission_60350/")[1]), r.src_subject_id, r.side, r.seq, cache_dir, a.visit)
             for r in idx.itertuples()]
-    vols = np.lib.format.open_memmap(os.path.join(OAI_DIR, "volumes.npy"), mode="w+", dtype=np.uint8, shape=(len(jobs), 32, 128, 128))
+    vols = np.lib.format.open_memmap(os.path.join(out_dir, "volumes.npy"), mode="w+", dtype=np.uint8, shape=(len(jobs), 32, 128, 128))
     metas, geoms, t0 = [], {}, time.time()
     with ProcessPoolExecutor(a.workers) as ex:
         for i, (v, meta, geom) in enumerate(ex.map(process, jobs, chunksize=4)):
@@ -124,8 +129,8 @@ def main():
                 print(f"{i + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
     vols.flush()
     s = pd.DataFrame(metas)
-    s.to_csv(os.path.join(OAI_DIR, "series.csv"), index=False)
-    with open(os.path.join(OAI_DIR, "geometry.json"), "w") as f:
+    s.to_csv(os.path.join(out_dir, "series.csv"), index=False)
+    with open(os.path.join(out_dir, "geometry.json"), "w") as f:
         json.dump(geoms, f)
     print(f"-> {int((s.status == 'ok').sum())}/{len(s)} series in {time.time() - t0:.0f}s;",
           s[s.status == "ok"].groupby("seq")[["slab", "n_slices"]].median().to_dict("index"))

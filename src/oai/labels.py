@@ -3,6 +3,7 @@
     python -m oai.labels --visit 00             # v2 rules below (superseded) -> labels_moaks00.csv
     python -m oai.labels --graded               # graded convention labels (in use) -> labels_moaks00_v4.csv
     python -m oai.labels --aux                  # 25 MOAKS gradings for pretraining -> aux_moaks00.csv
+    python -m oai.labels --bml                  # contusion from bone marrow lesions -> labels_moaks00_bml.csv
 
 One knee = one "study" `OAI_<participant id>_<RIGHT|LEFT>`. Several reading projects scored
 some knees; their labels are averaged (soft labels).
@@ -38,6 +39,23 @@ from params import INPUT_FOLDER, OUTPUT_FOLDER
 
 MOAKS_DIR = os.path.join(INPUT_FOLDER, "oai", "Semi-Quant Scoring_ASCII")
 OAI_DIR = os.path.join(OUTPUT_FOLDER, "oai")
+MONTHS = {"00": "00", "01": "12", "03": "24"}          # MOAKS visit code -> months
+
+
+def visit_dir(visit):
+    """output/oai (baseline) or output/oai_m<months> (follow-up visits)."""
+    return OAI_DIR if visit == "00" else os.path.join(OUTPUT_FOLDER, f"oai_m{MONTHS[visit]}")
+
+
+def knee_uid(oai_id, side, visit="00"):
+    """One "study" per knee and visit: OAI_<id>_<RIGHT|LEFT> at baseline, OAI<months>_<id>_<side> after."""
+    return f"OAI_{oai_id}_{side}" if visit == "00" else f"OAI{MONTHS[visit]}_{oai_id}_{side}"
+
+
+def parse_side(col):
+    """MOAKS SIDE: "1: Right" / "2: Left" text (baseline file) or 1 / 2 codes (follow-up files) -> RIGHT / LEFT."""
+    s = col.astype(str).str.strip()
+    return s.str.extract(r"(Right|Left)", expand=False).str.upper().fillna(s.str[0].map({"1": "RIGHT", "2": "LEFT"}))
 COMP = {
     "Medial OA": dict(cart=["FMC", "FMP", "TMA", "TMC", "TMP"], bml=["FMC", "FMP", "TMA", "TMC", "TMP"], ost=["FMC", "FMP", "TM"],
                       men="M"),
@@ -105,8 +123,8 @@ def knee_labels(r, v):
 
 def build(visit="00"):
     m = pd.read_csv(os.path.join(MOAKS_DIR, f"kMRI_SQ_MOAKS_BICL{visit}.txt"), sep="|", low_memory=False)
-    m["side"] = m.SIDE.astype(str).str.extract(r"(Right|Left)", expand=False).str.upper()
-    rows = [dict(StudyInstanceUID=f"OAI_{r['ID']}_{r['side']}", oai_id=str(r["ID"]), side=r["side"], project=r["READPRJ"],
+    m["side"] = parse_side(m.SIDE)
+    rows = [dict(StudyInstanceUID=knee_uid(r['ID'], r['side'], visit), oai_id=str(r["ID"]), side=r["side"], project=r["READPRJ"],
                  **knee_labels(r, visit)) for r in m.to_dict("records")]
     d = pd.DataFrame(rows)
     lab = [c for c in d.columns if c not in ("StudyInstanceUID", "oai_id", "side", "project")]
@@ -121,16 +139,25 @@ def main():
     p.add_argument("--visit", default="00")
     p.add_argument("--graded", action="store_true", help="graded convention labels (build_graded) -> labels_moaks<visit>_v4.csv")
     p.add_argument("--aux", action="store_true", help="the 25 MOAKS pretraining targets (build_aux) -> aux_moaks<visit>.csv")
+    p.add_argument("--bml", action="store_true", help="contusion from bone marrow lesions (build_bml) -> labels_moaks<visit>_bml.csv")
     a = p.parse_args()
-    os.makedirs(OAI_DIR, exist_ok=True)
+    out_dir = visit_dir(a.visit)
+    os.makedirs(out_dir, exist_ok=True)
+    if a.bml:
+        out = build_bml(a.visit)
+        path = os.path.join(out_dir, f"labels_moaks{a.visit}_bml.csv")
+        out.to_csv(path, index=False)
+        print(f"-> {path}: {len(out)} knees; Contusion mean {out.Contusion.mean():.3f}, > 0: {(out.Contusion > 0).mean():.3f}")
+        print(out.Contusion.round(3).value_counts().sort_index().to_string())
+        return
     if a.graded or a.aux:
         out = build_graded(a.visit) if a.graded else build_aux(a.visit)
-        path = os.path.join(OAI_DIR, f"labels_moaks{a.visit}_v4.csv" if a.graded else f"aux_moaks{a.visit}.csv")
+        path = os.path.join(out_dir, f"labels_moaks{a.visit}_v4.csv" if a.graded else f"aux_moaks{a.visit}.csv")
         out.to_csv(path, index=False)
         print(f"-> {path}: {len(out)} knees")
         return
     out = build(a.visit)
-    path = os.path.join(OAI_DIR, f"labels_moaks{a.visit}.csv")
+    path = os.path.join(out_dir, f"labels_moaks{a.visit}.csv")
     out.to_csv(path, index=False)
     print(f"-> {path}: {len(out)} knees")
     lab = [c for c in out.columns if c not in ("StudyInstanceUID", "oai_id", "side")]
@@ -179,8 +206,8 @@ def aux_targets(r, v="00"):
 
 def build_aux(visit="00"):
     m = pd.read_csv(os.path.join(MOAKS_DIR, f"kMRI_SQ_MOAKS_BICL{visit}.txt"), sep="|", low_memory=False)
-    m["side"] = m.SIDE.astype(str).str.extract(r"(Right|Left)", expand=False).str.upper()
-    rows = [dict(StudyInstanceUID=f"OAI_{r['ID']}_{r['side']}", **aux_targets(r, visit)) for r in m.to_dict("records")]
+    m["side"] = parse_side(m.SIDE)
+    rows = [dict(StudyInstanceUID=knee_uid(r['ID'], r['side'], visit), **aux_targets(r, visit)) for r in m.to_dict("records")]
     return pd.DataFrame(rows).groupby("StudyInstanceUID").mean().reset_index()
 
 
@@ -213,11 +240,11 @@ def meniscus_graded(r, v, side):
 
 def build_graded(visit="00"):
     m = pd.read_csv(os.path.join(MOAKS_DIR, f"kMRI_SQ_MOAKS_BICL{visit}.txt"), sep="|", low_memory=False)
-    m["side"] = m.SIDE.astype(str).str.extract(r"(Right|Left)", expand=False).str.upper()
+    m["side"] = parse_side(m.SIDE)
     rows = []
     for r in m.to_dict("records"):
         acl, pop = code(r.get(f"V{visit}MACLTR")), code(r.get(f"V{visit}MPOPCYS"))
-        rows.append(dict(StudyInstanceUID=f"OAI_{r['ID']}_{r['side']}",
+        rows.append(dict(StudyInstanceUID=knee_uid(r['ID'], r['side'], visit),
                          **{"ACL": np.nan if not np.isfinite(acl) else {0: 0.0, 1: 0.5, 2: 1.0}[int(acl)],
                             "Medial Meniscus": meniscus_graded(r, visit, "M"), "Lateral Meniscus": meniscus_graded(r, visit, "L"),
                             "Medial OA": oa_graded(r, visit, "Medial OA"), "Lateral OA": oa_graded(r, visit, "Lateral OA"),
@@ -230,6 +257,25 @@ def build_graded(visit="00"):
     for c in ("MCL", "Contusion", "Fracture"):
         out[c] = np.nan
     return out
+
+
+# --------------------------------------------- contusion from bone marrow lesions (experiment)
+
+BML_SUBREGIONS = ["FMA", "FLA", "FMC", "FLC", "FMP", "FLP", "SS", "TMA", "TLA", "TMC", "TLC", "TMP", "TLP", "PM", "PL"]
+
+
+def build_bml(visit="00", discount=0.5):
+    """Contusion = discount x (largest BML size grade over the 15 MOAKS subregions) / 3.
+    The convention's contusion is impact edema; OAI BMLs are almost all degenerative, which the radiologists of the
+    58 count positive about half the time -> 0.5 discount (a grade-3 BML gives 0.5, no BML 0). Other findings NaN."""
+    m = pd.read_csv(os.path.join(MOAKS_DIR, f"kMRI_SQ_MOAKS_BICL{visit}.txt"), sep="|", low_memory=False)
+    m["side"] = parse_side(m.SIDE)
+    rows = []
+    for r in m.to_dict("records"):
+        size = np.array([code(r.get(f"V{visit}MBMS{s}")) for s in BML_SUBREGIONS])
+        rows.append(dict(StudyInstanceUID=knee_uid(r["ID"], r["side"], visit),
+                         Contusion=discount * np.nanmax(size) / 3 if np.isfinite(size).any() else np.nan))
+    return pd.DataFrame(rows).groupby("StudyInstanceUID").mean().reset_index().dropna()
 
 
 if __name__ == "__main__":
