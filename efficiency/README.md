@@ -95,6 +95,31 @@ Estimate for about 1,300 test studies on 2×T4 (per GPU, 650 studies), from H100
 
 The expected total is about 3–4 min, likely bound by I/O. This needs a Kaggle run to confirm.
 
+## TensorRT (optional, `trt/`)
+
+TensorRT engines replace the ROI U-Net and the backbone of each crop model: `Crop25D`'s per-frame part (resize, mean/std, encoder, pooled head). The finding/plane embeddings, LSTM and attention pooling stay in PyTorch, so a joint crop still takes one encoder pass for its 4 findings. Anything without an engine runs in PyTorch.
+
+1. **Export (`trt/export_onnx.py`):** fp16 ONNX graphs with fixed shapes: `unet.onnx` (16 × 1 × 32 × 128 × 128) and `enc_<model>.onnx` (512 frames). ONNX Runtime matches PyTorch fp16 with correlation ≥ 0.99999. The exports are in `output/dataset_efficiency_onnx` (Kaggle `theoviel/rsna-knee-onnx-efficiency`).
+2. **Build and benchmark on a T4 (`trt/rsna-knee-trt-build.ipynb`, internet on):**
+   - installs `tensorrt-cu12`/`-cu13` into `trtlib/` and builds strongly typed fp16 engines (`trt/trt_runtime.py`; TensorRT 11 has no fp16 builder flag);
+   - benchmarks each network against PyTorch, then runs `pipeline.py` on 2 × 300 train studies, PyTorch against TensorRT;
+   - its output (`engines/` + `trtlib/`) becomes the dataset `theoviel/rsna-knee-trt-efficiency`. Engines only load on the GPU model and TensorRT version that built them.
+3. **Use:** `pipeline.py --engines <dir>`. The notebook does it when that dataset is attached, putting `trtlib/` on `PYTHONPATH`.
+
+On an H100 (TensorRT 11.4), against PyTorch fp16 at the same batch:
+
+| Network | Speedup |
+|---|---|
+| U-Net | 1.74× |
+| ConvNeXt backbones | 1.33× |
+| Joint (24-frame) backbones | 1.38× |
+| CAFormer | 2.15× |
+| CoAtNet | 1.11× |
+
+Through the pipeline with validation weights, the score is 0.9448 / 0.9391 against 0.9447 / 0.9391 without TensorRT.
+
+Engines are large under TensorRT 11 (377 MB per ConvNeXt engine). The `tensorrt` package is about 5 GB for CUDA 13, and each GPU process loads it at startup. The T4 notebook measures both costs.
+
 ## Files
 
 | | |

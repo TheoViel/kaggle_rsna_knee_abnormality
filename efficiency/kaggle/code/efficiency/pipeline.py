@@ -263,14 +263,19 @@ def shareable(net):
     return getattr(net, "fusion", None) == "late" and getattr(net, "head_type", None) != "map3d"
 
 
-def encode(net, x):
-    """Crop25D.embed up to the slice vectors, without the finding / plane embedding -> (B, D, C)."""
+def encode(net, x, engine=None):
+    """Crop25D.embed up to the slice vectors, without the finding / plane embedding -> (B, D, C).
+    engine: TensorRT FrameEncoder (trt/export_onnx.py) of a fixed frame batch, used instead of the PyTorch encoder."""
     import torch.nn.functional as F
 
     b, d, s, _ = x.shape
     idx = torch.arange(d, device=x.device)
     trip = torch.stack([idx.sub(1).clamp(min=0), idx, idx.add(1).clamp(max=d - 1)], 1)
     frames = x[:, trip].reshape(b * d, 3, s, s)
+    if engine is not None:
+        n = engine.in_shape[0]
+        assert len(frames) % n == 0, (len(frames), n)
+        return torch.cat([engine(frames[i:i + n]) for i in range(0, len(frames), n)]).reshape(b, d, -1)
     if net.img_size and net.img_size != s:
         frames = F.interpolate(frames, size=(net.img_size, net.img_size), mode="bilinear", align_corners=False)
     net._d = d
@@ -292,7 +297,9 @@ def head(net, f, roi, plane, both=False):
 
 
 class Models:
-    def __init__(self, weights, recipe, device, half=True):
+    def __init__(self, weights, recipe, device, half=True, engines=None):
+        """engines: folder of TensorRT engines (unet.engine, enc_<model>.engine, built on this GPU model by
+        trt/build_benchmark.py); the networks without an engine stay in PyTorch."""
         from crops.train import GROUPS, PLANES, build_model as build_crop_model, crop_index, finding_of
         from roi.extract import ROI_CLASSES
         from roi.train import build_model
@@ -309,6 +316,15 @@ class Models:
         self.unet = build_model(num_classes=k)
         self.unet.load_state_dict(sd)
         self.unet = self.unet.to(device, self.dtype).eval()
+        self.trt = {}
+        if engines:
+            sys.path.insert(0, os.path.join(HERE, "trt"))
+            from trt_runtime import TRTModule
+
+            for f in sorted(os.listdir(engines)):
+                if f.endswith(".engine"):
+                    self.trt[f[:-len(".engine")]] = TRTModule(os.path.join(engines, f), device)
+        self.unet_trt = self.trt.get("unet")
         self.crops = []
         refs = {m for r in recipe.values() for m in r["models"]}
         self.restricted = [(x, x.split("@")[0], x.split("@")[1].split(",")) for x in sorted(refs) if "@" in x]
@@ -332,7 +348,8 @@ class Models:
             z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)
             z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
                                    "compartment", "oa_midline", "union", "fibula") if k in z}
-            self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
+            self.crops.append(dict(name=m, net=net, trt=self.trt.get(f"enc_{m}") if shareable(net) else None,
+                                   z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
                                    aux=a["aux"] if a.get("aux") else None, planes_all=PLANES,
                                    rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
 
@@ -343,12 +360,15 @@ class Models:
 
         pl = z(SIDE_BATCH, dtype=torch.long, device=self.device)
         self.side(model_input(z((SIDE_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device), pl).to(dt))
-        self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device, dtype=dt))
+        (self.unet_trt or self.unet)(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device, dtype=dt))
         for m in self.crops:
             i = z(CROP_BATCH, dtype=torch.long, device=self.device)
             k = json.loads(m["z"])
-            m["net"](z((CROP_BATCH, k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device,
-                       dtype=dt), i, i)
+            x = z((CROP_BATCH, k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device, dtype=dt)
+            if m["trt"] is not None:
+                head(m["net"], encode(m["net"], x, m["trt"]), i, i)
+            else:
+                m["net"](x, i, i)
         torch.cuda.synchronize()
 
 
@@ -428,7 +448,8 @@ def process_gpu(studies, models, timer):
     for i in range(0, len(seg), UNET_BATCH):
         part = seg[i:i + UNET_BATCH]
         x = torch.stack([s["volume"].flip(_lr_axis(s["plane"])) if s["side"] == "L" else s["volume"] for s in part])
-        prob = torch.sigmoid(models.unet(_padded(x[:, None], UNET_BATCH).to(dt) / 255).float())[:len(part)]
+        prob = torch.sigmoid((models.unet_trt or models.unet)(_padded(x[:, None], UNET_BATCH).to(dt) / 255).float())
+        prob = prob[:len(part)]
         prob = torch.stack([prob[j].flip(_lr_axis(s["plane"]) + 1) if (s["side"] == "L") ^ s["conv_flip"]
                             else prob[j] for j, s in enumerate(part)])
         for s, sub in zip(part, gpu_regions(prob)):
@@ -534,15 +555,16 @@ def process_post(studies, ser, models, timer):
                  for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
                  for c, (roi, rid) in m["rois"].items() if have[j, roi]]
         res = []
-        if shareable(m["net"]) and len(m["rois"]) > 1 and len({r for r, _ in m["rois"].values()}) < len(m["rois"]):
-            # Several findings per crop: encoder once per (series, crop), heads per finding.
+        if m["trt"] is not None or (shareable(m["net"]) and len({r for r, _ in m["rois"].values()}) < len(m["rois"])):
+            # Encoder (TensorRT engine, or PyTorch when several findings share a crop) once per (series, crop),
+            # then the heads per finding.
             uniq = sorted({(j, roi) for j, roi, *_ in items})
             pos = {u: k for k, u in enumerate(uniq)}
             feats = []
             for i in range(0, len(uniq), CROP_BATCH):
                 part = uniq[i:i + CROP_BATCH]
                 j, roi = (torch.tensor(v, device=dev) for v in zip(*part))
-                feats.append(encode(m["net"], _padded(x_all[j, roi], CROP_BATCH).to(dt) / 255)[:len(part)])
+                feats.append(encode(m["net"], _padded(x_all[j, roi], CROP_BATCH).to(dt) / 255, m["trt"])[:len(part)])
             feats = torch.cat(feats)
             u = torch.tensor([pos[(j, roi)] for j, roi, *_ in items], device=dev)
             rid = torch.tensor([it[2] for it in items], device=dev)
@@ -591,7 +613,8 @@ def run_shard(df, weights, recipe, out_dir, threads, half=True):
     dev = torch.device("cuda")
     t0 = time.time()
     reader = process_reader(df, threads, READ_PROCS) if READ_PROCS else StudyReader(df, threads)
-    models = Models(weights, recipe, dev, half)
+    models = Models(weights, recipe, dev, half, os.environ.get("KNEE_ENGINES") or None)
+    print(f"TensorRT engines: {sorted(models.trt) or 'none'}", flush=True)
     timer = dict.fromkeys(["load", "warmup", "wait", "prep", "side", "unet", "boxes", "consensus", "crops",
                            "models"], 0.0)
     timer["load"] = time.time() - t0
@@ -706,6 +729,7 @@ def main():
     p.add_argument("--studies", default=None, help="csv with a StudyInstanceUID column: only these studies")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--fp32", action="store_true")
+    p.add_argument("--engines", default=None, help="TensorRT engines folder (trt/build_benchmark.py, same GPU model)")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     a = p.parse_args()
     if a.shard is not None:
@@ -714,6 +738,8 @@ def main():
         df = df[df["shard"] == a.shard]
         run_shard(df, a.weights, recipe, os.path.join(a.out_dir, f"shard{a.shard}"), a.threads, not a.fp32)
         return
+    if a.engines:
+        os.environ["KNEE_ENGINES"] = os.path.abspath(a.engines)
     studies = pd.read_csv(a.studies).StudyInstanceUID.tolist() if a.studies else None
     run(a.data_dir, a.weights, a.out_dir, a.submission, a.gpus.split(","), a.threads, a.series_dir, a.series_csv,
         a.limit, a.rule, a.recipe, not a.fp32, studies)

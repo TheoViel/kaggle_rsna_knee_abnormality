@@ -82,6 +82,9 @@ def main():
     os.makedirs(os.path.join(code, "efficiency"))
     for f in ("pipeline.py", "fast_dicom.py", "fast_consensus.py"):
         shutil.copy(os.path.join(HERE, f), os.path.join(code, "efficiency"))
+    os.makedirs(os.path.join(code, "efficiency", "trt"))
+    for f in ("export_onnx.py", "trt_runtime.py", "build_benchmark.py"):
+        shutil.copy(os.path.join(HERE, "trt", f), os.path.join(code, "efficiency", "trt"))
     import dynamic_network_architectures as dna
     shutil.copytree(os.path.dirname(dna.__file__), os.path.join(code, "dynamic_network_architectures"),
                     ignore=shutil.ignore_patterns("__pycache__"))
