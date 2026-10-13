@@ -4,7 +4,7 @@
 
 kaggle/code/     src/ (python files), efficiency's pipeline.py / fast_dicom.py / fast_consensus.py, and
                  dynamic_network_architectures (the ROI U-Net's architecture: no pip install in the notebook)
-kaggle/weights/  side/, roi/, crops/<model>/ (args.json + ckpt_final.pt in float16) and recipe.json: only the models
+output/dataset_efficiency/  side/, roi/, crops/<model>/ (args.json + ckpt_final.pt in float16) and recipe.json: only the models
                  the recipe uses (fullfit weights of output/dataset_2_moaks_mrnet_men_frac + the joint4 Codex fullfit)
 """
 
@@ -28,6 +28,31 @@ PLUS = {c: v + (["mk87"] if "Meniscus" in c else []) + (["j28"] if v == ["jc1"] 
 EXTRA_SRC = {"j28": os.path.join(ROOT, "output", "dataset_3", "crops", "j28")}
 
 
+README = """# dataset_efficiency
+
+Weights of the efficiency pipeline (efficiency/pipeline.py, notebook efficiency/rsna-knee-inf-eff.ipynb), in float16:
+side/ and roi/ (side classifier, ROI U-Net), crops/<model>/ (args.json + ckpt_final.pt), recipe.json, recipe_plus.json.
+Built by efficiency/build_package.py; the code dataset is efficiency/kaggle/code (theoviel/rsna-knee-code-eff).
+
+One model per finding, read on one sagittal + one coronal series per study (fluid-sensitive first):
+
+| Finding | Model | Source (fullfit) |
+|---|---|---|
+| ACL | mr85 | output/dataset_2_moaks_mrnet_men_frac |
+| MCL | pl86 | output/dataset_2_moaks_mrnet_men_frac |
+| Medial / lateral meniscus | cafax87 | output/dataset_2_moaks_mrnet_men_frac |
+| Medial / lateral / PF OA | mk90 | output/dataset_2_moaks_mrnet_men_frac |
+| Baker's | 91 | output/dataset_2_moaks_mrnet_men_frac |
+| Effusion, synovitis, contusion, fracture | jc1 (joint4 capsule crop, Codex labels) | {jc1} |
+
+Validation counterparts through the pipeline: 58 radiologist studies 0.9447, holdout 0.9391 (12 findings);
+the latest submission scores 0.9544 on the 58. Per-finding table: efficiency/README.md.
+
+recipe_plus.json adds mk87 on the menisci and j28 (output/dataset_3, main agent's joint model) on the 4 joint findings:
+58 0.9443 / holdout 0.9421, about 1.8x the crop-model time.
+"""
+
+
 def half_copy(src_dir, dst_dir):
     os.makedirs(dst_dir, exist_ok=True)
     shutil.copy(os.path.join(src_dir, "args.json"), dst_dir)
@@ -43,7 +68,8 @@ def half_copy(src_dir, dst_dir):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--jc1", default=os.path.join(ROOT, "logs", "bis", "crops_run", "2026-10-12", "3"))
-    p.add_argument("--out", default=os.path.join(HERE, "kaggle"))
+    p.add_argument("--out", default=os.path.join(HERE, "kaggle"), help="code -> <out>/code")
+    p.add_argument("--weights_out", default=os.path.join(ROOT, "output", "dataset_efficiency"))
     a = p.parse_args()
     args = json.load(open(os.path.join(a.jc1, "args.json")))
     assert args["group"] == "joint4" and args["labels"] == "codex", args
@@ -60,7 +86,7 @@ def main():
     shutil.copytree(os.path.dirname(dna.__file__), os.path.join(code, "dynamic_network_architectures"),
                     ignore=shutil.ignore_patterns("__pycache__"))
 
-    w = os.path.join(a.out, "weights")
+    w = a.weights_out
     shutil.rmtree(w, ignore_errors=True)
     for d in ("side", "roi"):
         half_copy(os.path.join(SUBMITTED, d), os.path.join(w, d))
@@ -69,8 +95,10 @@ def main():
         half_copy(src, os.path.join(w, "crops", m))
     json.dump(RECIPE, open(os.path.join(w, "recipe.json"), "w"), indent=1)
     json.dump(PLUS, open(os.path.join(w, "recipe_plus.json"), "w"), indent=1)
+    with open(os.path.join(w, "readme.md"), "w") as f:
+        f.write(README.format(jc1=os.path.relpath(a.jc1, ROOT)))
     for d, slug, title in ((code, "rsna-knee-code-eff", "RSNA knee code (efficiency)"),
-                           (w, "rsna-knee-weights-eff", "RSNA knee weights (efficiency)")):
+                           (w, "rsna-knee-weights-efficiency", "RSNA knee weights efficiency")):
         json.dump({"title": title, "id": f"theoviel/{slug}", "licenses": [{"name": "CC0-1.0"}]},
                   open(os.path.join(d, "dataset-metadata.json"), "w"), indent=1)
     for d in (code, w):

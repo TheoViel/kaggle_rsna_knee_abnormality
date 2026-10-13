@@ -101,7 +101,7 @@ The expected total is about 3–4 min, likely bound by I/O. This needs a Kaggle 
 |---|---|
 | `pipeline.py` | the pipeline (`python pipeline.py --data_dir … --weights … --out_dir … --gpus 0,1`); `--rule all` reads every series; env: `KNEE_THREADS`, `KNEE_READ_PROCS`, `KNEE_UNET_PLANES` |
 | `fast_dicom.py`, `fast_consensus.py` | the reader and the consensus |
-| `build_package.py` | `kaggle/code` (src/ + efficiency/ + dynamic_network_architectures) and `kaggle/weights` (fp16, recipe models only) |
+| `build_package.py` | `kaggle/code` (src/ + efficiency/ + dynamic_network_architectures; Kaggle `theoviel/rsna-knee-code-eff`) and `output/dataset_efficiency` (fp16, recipe models only; Kaggle `theoviel/rsna-knee-weights-efficiency`) |
 | `evaluate.py`, `recipes.py`, `additions.py`, `select_models.py`, `explore.py` | offline scoring from the validation runs' per-series predictions |
 | `score_sub.py` | score a pipeline submission on the validation studies (`val_studies.csv`, with the `weights_val/` symlinks) |
 | `bench.py` | GPU cost per network |
