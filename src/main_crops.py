@@ -20,7 +20,7 @@ import torch  # noqa: E402
 from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
 from crops.train import GROUPS, CropDataset, PairDataset, build_model, finding_of, fit, load_crops  # noqa: E402
-from knee_cls.data import load_tables, make_splits  # noqa: E402
+from knee_cls.data import load_tables, make_folds, make_splits  # noqa: E402
 from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
                                   seed_everything, worker_init_fn)
@@ -33,6 +33,9 @@ DEFAULTS = {
     "planes": "Sagittal,Coronal", "num_workers": 8, "seed": 0,
     "labels": "claude",
     "fullfit": False,
+    # K-fold (out-of-fold pseudo-labels, knee_cls.data.make_folds): validate on fold `fold` of `n_folds` over every
+    # training study, train on the others with the fullfit targets (radiologist labels on the 58). 0: off.
+    "n_folds": 0, "fold": 0,
     # Regularisation (crops.train.model_input / mix_batch): context crops (ctx > 1) with random
     # window shifts, random slice windows of depth_out slices, mixup / cutmix within a finding.
     # External data (OAI, see src/oai/): extra crop sets with their own labels; loss weight; OAI only
@@ -117,6 +120,10 @@ def main():
     studies, _ = load_tables()
     _, gt_ids, hold_ids = make_splits(studies, holdout_frac=0.1, seed=0)
     val_mask = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
+    if args.n_folds:
+        assert not args.fullfit, "k-fold and fullfit are exclusive"
+        folds = make_folds(studies, args.n_folds)
+        val_mask = info.StudyInstanceUID.map(folds).eq(args.fold)
     classes = GROUPS[args.group]
     targets = training_targets(args.labels, studies, classes)
     if extra is not None:
@@ -128,7 +135,7 @@ def main():
         assert not args.mixup and not args.cutmix and not args.mil_crops, "aux: no mixup / cutmix / MIL"
         al = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{args.aux_labels}.csv")).set_index("StudyInstanceUID")
         aux_t = {c: al[f"{c}|{args.aux}"] for c in classes if f"{c}|{args.aux}" in al}
-    if args.fullfit:
+    if args.fullfit or args.n_folds:
         # Fullfit (submission models): every study is trained on. The 58 radiologist studies
         # take their radiologist labels; every other study keeps the chosen soft labels.
         st_ = studies.set_index("StudyInstanceUID")
@@ -154,7 +161,7 @@ def main():
             t = targets[c].reindex(idx)
             gt = st_[f"gt_{c}"].reindex(idx)
             targets[c] = t.where(gt.isna(), gt)
-        train_ds = CropDataset(crops, info, classes, targets, aux_t)
+        train_ds = CropDataset(crops, info if args.fullfit else info[~val_mask], classes, targets, aux_t)
     else:
         train_ds = CropDataset(crops, info[~val_mask], classes, targets, aux_t)
     if extra is not None:
@@ -169,6 +176,9 @@ def main():
             val_t[c] = training_targets("claude", studies, [F])[F]
     val_ds = CropDataset(crops, info[val_mask], classes, val_t)
     if ctx.is_main:
+        if args.n_folds:
+            print(f"-> K-FOLD {args.fold} / {args.n_folds}: validation = fold {args.fold} of every training study "
+                  f"({info[val_mask].StudyInstanceUID.nunique()} studies); the 58 are scored on their radiologist labels")
         if args.fullfit:
             print("-> FULLFIT: validation studies are trained on, validation scores below are leaky")
         print(f"-> {args.output_dir}  group {args.group} {classes}  backbone {args.backbone}\n"

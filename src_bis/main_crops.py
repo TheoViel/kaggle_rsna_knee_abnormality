@@ -35,7 +35,8 @@ DEFAULTS = {
     "fullfit": False,
     "augmentations": {"rot_deg": 15.0, "scale_range": (0.85, 1.15), "shift": 0.08,
                       "gamma": 0.3, "contrast": 0.25, "brightness": 0.1},
-    "log_path": LOG_FOLDER + "crops_run/",
+    "freeze": 0, "ckpt": False,            # backbone "ortho": frozen blocks, gradient checkpointing (src_bis)
+    "log_path": LOG_FOLDER + "bis/crops_run/",
 }
 
 
@@ -50,7 +51,8 @@ def training_targets(which, studies, classes):
     claude = studies.set_index("StudyInstanceUID")
     if which.startswith("pl:"):
         # Pseudo-labels: output/crops/<name>.csv, StudyInstanceUID x findings (crops/predict.py + teacher averaging).
-        pl = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{which[3:]}.csv")).set_index("StudyInstanceUID")
+        path = which[3:] if which[3:].endswith(".csv") else os.path.join(OUTPUT_FOLDER, "crops", f"{which[3:]}.csv")
+        pl = pd.read_csv(path).set_index("StudyInstanceUID")
         return {c: pl[c] for c in classes}
     if which == "claude":
         return {c: claude[f"target_{c}"] for c in classes}

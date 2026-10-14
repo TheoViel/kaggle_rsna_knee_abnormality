@@ -47,12 +47,14 @@ def concat_sources(sources):
 
 
 class MTDataset(Dataset):
-    def __init__(self, arr, boxes, info, targets, classes=ROI_CLASSES, anatomy=None, aux=None, rep=None):
+    def __init__(self, arr, boxes, info, targets, classes=ROI_CLASSES, anatomy=None, aux=None, rep=None, ortho=None):
         """aux: optional DataFrame (StudyInstanceUID index, one column per auxiliary target, NaN = unknown).
         arr / boxes may be dicts keyed by `info.src` (`concat_sources`). Optional info columns: `w` (loss weight
         of the study, default 1) and `y_men` (any meniscal tear, side unknown: the MIL target, default NaN).
         Anatomy targets exist for our crop set only (src "main")."""
         self.arr, self.boxes, self.anatomy, self.classes = arr, boxes, anatomy, list(classes)
+        # (N, 16, 10, 1024) float16 OrthoFoundation features (`mt3d.ortho`) by row, or {src: array} (external sets)
+        self.ortho = ortho
         self.info = info.reset_index(drop=True)
         self.y_aux = None if aux is None else \
             aux.reindex(self.info.StudyInstanceUID).to_numpy(np.float32)
@@ -71,6 +73,9 @@ class MTDataset(Dataset):
         boxes = self.boxes[src] if isinstance(self.boxes, dict) else self.boxes
         w = float(r.get("w", 1.0))
         out = {"w": torch.tensor(1.0 if np.isnan(w) else w), "y_men": torch.tensor(float(r.get("y_men", np.nan)))}
+        o = self.ortho.get(src) if isinstance(self.ortho, dict) else (self.ortho if src == "main" else None)
+        if o is not None:
+            out["ortho"] = torch.from_numpy(np.array(o[r.row]))
         if self.y_aux is not None:
             out["y_aux"] = torch.from_numpy(self.y_aux[i])
         if self.y_rep is not None:
@@ -176,6 +181,15 @@ def masked_seg_loss(logits, target, labelled):
     return ((bce + dice) * m).sum() / m.sum()
 
 
+def plane_index(b, device, seq_embed=False):
+    """The plane embedding index: the plane, or with seq_embed plane + 3 x (2 x fluid-sensitive + fat-suppressed)."""
+    pl = b["plane"].to(device)
+    if seq_embed:
+        m = b["meta"].to(device).round().long()                   # (fluid-sensitive, fat-suppressed) flags
+        pl = pl + 3 * (2 * m[:, 0] + m[:, 1])
+    return pl
+
+
 def prepare_batch(b, device, size, aug=None):
     """-> image (B, 1, D, S, S), ROI box masks (B, 8, D, S, S), anatomy masks (B, 9, D, S, S) or None."""
     x = b["x"].to(device, non_blocking=True).float()[:, None] / 255          # B 1 D S S
@@ -194,7 +208,7 @@ def prepare_batch(b, device, size, aug=None):
 
 
 @torch.no_grad()
-def predict(model, loader, ds, device, size):
+def predict(model, loader, ds, device, size, seq_embed=False):
     model.eval()
     rows, dice = [], []
     pair = isinstance(ds, PairDataset)
@@ -203,7 +217,8 @@ def predict(model, loader, ds, device, size):
             b = flatten_pairs(b)
         x, target, _ = prepare_batch(b, device, size)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = model(x, b["plane"].to(device), target, *([b["valid"].to(device)] if pair else []))
+            out = model(x, plane_index(b, device, seq_embed), target, *([b["valid"].to(device)] if pair else []),
+                        **({"ortho": b["ortho"].to(device)} if "ortho" in b else {}))
         p = torch.sigmoid(out["cls"].float()).cpu().numpy()
         dice.append(seg_loss(out["seg"][-1], target)[1].cpu().numpy())
         rows += [(i, p[j].tolist()) for j, i in enumerate(b["idx"].tolist())]
@@ -256,11 +271,30 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
     device = ctx.device
     log = print if ctx.is_main else (lambda *a, **k: None)
     m = unwrap_model(model)
-    unet = [p for n, p in m.named_parameters() if n.startswith(("encoder", "transpconvs", "stages"))]
-    ids = {id(p) for p in unet}
-    opt = torch.optim.AdamW([{"params": unet, "lr": args.lr_unet},
-                             {"params": [p for p in m.parameters() if id(p) not in ids], "lr": args.lr}],
-                            weight_decay=args.weight_decay)
+    # Backbone parameters (lr_unet): "encoder..." in a Hybrid / MT3D, "base.encoder..." in a PairHybrid.
+    # (Until 2026-10-12 only the first form matched: pair / set runs trained their backbone at `lr`.)
+    def is_backbone(n):
+        n = n[len("base."):] if n.startswith("base.") else n
+        return n.startswith(("encoder", "transpconvs", "stages"))
+    groups, ids = [], set()
+    llrd = getattr(args, "llrd", 0)
+    blocks = getattr(getattr(getattr(m, "base", m), "encoder", None), "model", None)
+    if llrd and blocks is not None and hasattr(blocks, "blocks"):
+        # Layer-wise lr decay (ViT, `--backbone ortho`): block i of n at lr_unet * llrd ** (n - i);
+        # the patch embedding / tokens at the lowest rate, the final norm at lr_unet.
+        n_blk = len(blocks.blocks)
+        for i, b in enumerate(blocks.blocks):
+            ps = [p for p in b.parameters() if p.requires_grad]
+            groups.append({"params": ps, "lr": args.lr_unet * llrd ** (n_blk - i)})
+            ids |= {id(p) for p in ps}
+        rest = [p for n, p in m.named_parameters() if is_backbone(n) and id(p) not in ids and p.requires_grad]
+        low = [p for p in rest if p is not None and any(p is q for q in blocks.patch_embed.parameters())]
+        groups.append({"params": low, "lr": args.lr_unet * llrd ** (n_blk + 1)})
+        ids |= {id(p) for p in low}
+    unet = [p for n, p in m.named_parameters() if is_backbone(n) and id(p) not in ids]
+    ids |= {id(p) for p in unet}
+    groups += [{"params": unet, "lr": args.lr_unet}, {"params": [p for p in m.parameters() if id(p) not in ids], "lr": args.lr}]
+    opt = torch.optim.AdamW([g for g in groups if g["params"]], weight_decay=args.weight_decay)
     total = args.epochs * len(train_dl)
     warm = max(1, int(0.05 * total))
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -280,17 +314,26 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
             if getattr(args, "mixup", 0) > 0:
                 x, target, anat, y, b = mixup(x, target, anat, y, b, args.mixup, pair)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = model(x, b["plane"].to(device), target, *([b["valid"].to(device)] if pair else []))
+                out = model(x, plane_index(b, device, getattr(args, "seq_embed", False)), target, *([b["valid"].to(device)] if pair else []),
+                            **({"ortho": b["ortho"].to(device)} if "ortho" in b else {}))
             lab = ~torch.isnan(y)
             # Per-study loss weights (external data can be down- or up-weighted).
-            wl = b["w"].to(device).float()[:, None].expand_as(y)[lab]
+            cw = torch.tensor(getattr(args, "cls_w_vec", None) or [1.0] * y.shape[1], device=device)
+            wl = (b["w"].to(device).float()[:, None] * cw[None]).expand_as(y)[lab]
             l_cls = (F.binary_cross_entropy_with_logits(out["cls"].float()[lab], y[lab], reduction="none") * wl).sum() \
-                / wl.sum().clamp(min=1e-6)
+                / wl.sum().clamp(min=1e-6) if lab.any() else out["cls"].sum() * 0     # unlabelled batches (distillation)
             l_seg = sum(seg_loss(s, target)[0] for s in out["seg"]) / len(out["seg"])
             l_meta = F.binary_cross_entropy_with_logits(out["meta"].float(), b["meta"].to(device))
             l_anat = sum(masked_seg_loss(s, anat, b["anat_lab"].to(device)) for s in out["anat"]) / len(out["anat"]) \
                 if out["anat"] else torch.zeros((), device=device)
             loss = args.w_cls * l_cls + args.w_seg * l_seg + args.w_meta * l_meta + args.w_anat * l_anat
+            if "dist_roi" in out and "ortho" in b:
+                # Distillation: cosine distance to the OrthoFoundation ROI-pooled tokens / CLS, frame-averaged.
+                o = b["ortho"].to(device).float()
+                l_dist = (1 - F.cosine_similarity(out["dist_roi"].float(), o[:, :, 2:].mean(1), dim=-1)).mean() \
+                    + (1 - F.cosine_similarity(out["dist_glob"].float(), o[:, :, 0].mean(1), dim=-1)).mean()
+                loss = loss + args.w_dist * l_dist
+                run.setdefault("dist", []).append(float(l_dist.detach()))
             # MIL (MRNet): "a meniscal tear, side unknown" supervises max(medial, lateral meniscus logits).
             ym = b["y_men"].to(device).float()
             if getattr(args, "w_mil", 0) > 0 and (~torch.isnan(ym)).any():
@@ -331,9 +374,9 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler):
             run["anat"].append(float(l_anat.detach()))
             if it % args.log_every == 0:
                 r = all_reduce_mean({k: float(np.mean(v[-args.log_every:])) for k, v in run.items()}, device)
-                log(f"  [{it}/{total}] ep {epoch}  cls {r['cls']:.4f}  seg {r['seg']:.4f}  anat {r['anat']:.4f}  rep {r.get('rep', 0):.4f}  meta {r['meta']:.4f}  "
+                log(f"  [{it}/{total}] ep {epoch}  cls {r['cls']:.4f}  seg {r['seg']:.4f}  anat {r['anat']:.4f}  rep {r.get('rep', 0):.4f}  dist {r.get('dist', 0):.4f}  meta {r['meta']:.4f}  "
                     f"lr {sched.get_last_lr()[0]:.1e}  {time.time() - t0:.0f}s")
-        long, wide, dice = predict(ema if ema is not None else m, val_dl, val_ds, device, args.size)
+        long, wide, dice = predict(ema if ema is not None else m, val_dl, val_ds, device, args.size, getattr(args, 'seq_embed', False))
         tab, study_tab = study_auc(long, studies)
         log(f"epoch {epoch + 1}  gt {tab['gt'].mean():.4f}  hold {tab['hold'].mean():.4f}  "
             + "  ".join(f"{c[:10]} {r['gt']:.3f}/{r['hold']:.3f}" for c, r in tab.iterrows())

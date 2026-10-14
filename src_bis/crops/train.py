@@ -48,6 +48,9 @@ GROUPS = {
     "joint4": ["Effusion", "Synovitis", "Contusion", "Fracture"], "bone": ["Contusion", "Fracture"],
     # Both tibiofemoral compartments from one crop that shows both (single-crop sets).
     "tf": ["Medial OA", "Lateral OA"],
+    # One OA compartment per model (src_bis/train_group.py): the encoder cannot share "arthritic knee" features
+    # learned from the other compartments' targets (lateral_oa on oa_cmp30_mid crops: OA overnight 2026-10-14).
+    "pf_oa": ["PF OA"], "lateral_oa": ["Lateral OA"], "medial_oa": ["Medial OA"],
 }
 CAPSULE_FINDINGS = ("Effusion", "Synovitis", "Contusion", "Fracture")      # findings read from the capsule crop
 
@@ -133,7 +136,7 @@ class Crop25D(nn.Module):
     """
 
     def __init__(self, backbone, n_rois, pretrained=True, img_size=None, hidden=256, dropout=0.2,
-                 drop_path=0.1, head="lstm", fusion="late", depth=None):
+                 drop_path=0.1, head="lstm", fusion="late", depth=None, freeze=0, ckpt=False):
         super().__init__()
         kw = {"drop_path_rate": drop_path} if drop_path else {}
         if img_size and any(k in backbone for k in ("maxvit", "coatnet", "maxxvit", "tiny_vit", "efficientvit_m")):
@@ -143,7 +146,22 @@ class Crop25D(nn.Module):
         self.fusion, self.head_type = fusion, head
         if fusion == "early":
             kw["in_chans"] = depth
-        self.encoder = timm.create_model(backbone, pretrained=pretrained, num_classes=0, **kw)
+        if backbone == "ortho":
+            # OrthoFoundation (knee DINOv3 ViT-L/16, src_bis/mt3d/ortho.py): blocks below `freeze` frozen,
+            # gradient checkpointing; tokens average-pooled by forward_head, as for timm ViTs.
+            from mt3d.ortho import load_ortho
+            import timm as _timm
+            self.encoder = load_ortho() if pretrained else _timm.create_model(
+                "vit_large_patch16_dinov3", pretrained=False, num_classes=0, img_size=224)
+            for p_ in self.encoder.patch_embed.parameters():
+                p_.requires_grad = freeze == 0
+            for b in self.encoder.blocks[:freeze]:
+                for p_ in b.parameters():
+                    p_.requires_grad = False
+            if ckpt:
+                self.encoder.set_grad_checkpointing(True)
+        else:
+            self.encoder = timm.create_model(backbone, pretrained=pretrained, num_classes=0, **kw)
         # Pooled vector size (some heads add a conv after pooling, e.g. MobileNetV4); map channels for map3d.
         c = self.encoder.num_features if head == "map3d" else \
             (getattr(self.encoder, "head_hidden_size", None) or self.encoder.num_features)
@@ -279,7 +297,8 @@ def build_model(a, n_rois, pretrained=False):
     return Crop25D(a["backbone"], n_rois, pretrained=pretrained, img_size=a.get("img_size") or None,
                    hidden=a.get("hidden", 256), dropout=a.get("dropout", 0.2) if pretrained else 0.0,
                    drop_path=a.get("drop_path", 0.1) if pretrained else 0.0, head=a.get("head", "lstm"),
-                   fusion=a.get("fusion", "late"), depth=z.get("depth", 12))
+                   fusion=a.get("fusion", "late"), depth=z.get("depth", 12), freeze=a.get("freeze", 0),
+                   ckpt=a.get("ckpt", False))
 
 
 # ---------------------------------------------------------------- scoring

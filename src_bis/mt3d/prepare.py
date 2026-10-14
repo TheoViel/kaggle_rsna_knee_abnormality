@@ -85,10 +85,12 @@ def main():
     p.add_argument("--volumes", default="", help="series table .csv (default: output/roi/volumes.csv)")
     p.add_argument("--cache_dir", default=CACHE_DIR)
     p.add_argument("--side_csv", default="", help="SeriesInstanceUID, side (R / L) instead of the side classifier's")
+    p.add_argument("--planes", default="Sagittal,Coronal", help="planes kept (Axial: --volumes ../output/roi/volumes_axial.csv "
+                   "--boxes ../output/roi/labels/round3_axial.csv, boxes registered from the other planes)")
     a = p.parse_args()
     os.makedirs(MT_DIR, exist_ok=True)
     vols = pd.read_csv(a.volumes or os.path.join(OUTPUT_FOLDER, "roi", "volumes.csv"))
-    vols = vols[vols.Anatomical_Plane.isin(["Sagittal", "Coronal"])].reset_index(drop=True)
+    vols = vols[vols.Anatomical_Plane.isin(a.planes.split(","))].reset_index(drop=True)
     if a.limit:
         vols = vols.iloc[:a.limit]
     fat = pd.read_csv(os.path.join(INPUT_FOLDER, "train_series.csv")).set_index("SeriesInstanceUID").Fat_Suppression

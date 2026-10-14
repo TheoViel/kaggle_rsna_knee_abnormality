@@ -48,15 +48,54 @@ def masked_mean(w, h):
         return torch.einsum("bkn,bcn->bkc", w, h.float().flatten(2)) / (w.sum(-1, keepdim=True) + 1e-3)
 
 
+class OrthoEncoder(nn.Module):
+    """OrthoFoundation (DINOv3 ViT-L/16, `mt3d.ortho.load_ortho`) as a features_only-style encoder: the
+    patch tokens of blocks `levels` as (B, 1024, 14, 14) maps at 224 px, with the attributes Hybrid reads
+    (feature_info.channels() / .reduction(), pretrained_cfg). `freeze`: blocks below it are frozen (and the
+    patch embedding); `ckpt`: gradient checkpointing of the trainable blocks."""
+
+    def __init__(self, levels=(11, 17, 23), freeze=0, ckpt=False, pretrained=True):
+        super().__init__()
+        from types import SimpleNamespace
+
+        import timm
+
+        from mt3d.ortho import load_ortho
+        self.model = load_ortho() if pretrained else timm.create_model(
+            "vit_large_patch16_dinov3", pretrained=False, num_classes=0, img_size=224)
+        self.levels = list(levels)
+        n = len(self.levels)
+        self.feature_info = SimpleNamespace(channels=lambda: [1024] * n, reduction=lambda: [16] * n)
+        self.pretrained_cfg = {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)}
+        if freeze:
+            for p_ in self.model.patch_embed.parameters():
+                p_.requires_grad = False
+            for name in ("cls_token", "reg_token"):
+                if getattr(self.model, name, None) is not None:
+                    getattr(self.model, name).requires_grad = False
+            for b in self.model.blocks[:freeze]:
+                for p_ in b.parameters():
+                    p_.requires_grad = False
+        if ckpt:
+            self.model.set_grad_checkpointing(True)
+
+    def forward(self, x):
+        return self.model.forward_intermediates(x, indices=self.levels, norm=True, output_fmt="NCHW", intermediates_only=True)
+
+
 class Hybrid(nn.Module):
     def __init__(self, backbone="convnext_tiny.fb_in22k", frames=16, dec=192, dim=256, tf_layers=2, dropout=0.2,
                  drop_path=0.1, n_cls=len(ROI_CLASSES), n_anat=0, pretrained=True, pool="pred",
                  levels=(1, 2, 3), anat_tokens=False, zpos=False, nb=1, zoom=(), zoom_size=128, zoom_frames=8,
-                 zoom_margin=0.25, aux_roi=(), rep_dim=0):
+                 zoom_margin=0.25, aux_roi=(), rep_dim=0, freeze=0, ckpt=False, ortho="", extra_head="union",
+                 seq_embed=False):
         super().__init__()
-        kw = {"img_size": 224} if "vit" in backbone else {}
-        self.encoder = timm.create_model(backbone, pretrained=pretrained, features_only=True,
-                                         out_indices=tuple(levels), drop_path_rate=drop_path, **kw)
+        if backbone == "ortho":
+            self.encoder = OrthoEncoder(levels, freeze=freeze, ckpt=ckpt, pretrained=pretrained)
+        else:
+            kw = {"img_size": 224} if "vit" in backbone else {}
+            self.encoder = timm.create_model(backbone, pretrained=pretrained, features_only=True,
+                                             out_indices=tuple(levels), drop_path_rate=drop_path, **kw)
         ch = self.encoder.feature_info.channels()
         # Plain ViTs (e.g. DINOv2) give every level at one stride: their maps are resampled to strides
         # 8, 16, 32 (ViTDet-style simple pyramid), so the decoder and the pooling are the CNNs'.
@@ -67,15 +106,24 @@ class Hybrid(nn.Module):
         n_roi = len(ROI_CLASSES)
         self.frames, self.n_cls, self.n_roi, self.pool, self.nb = frames, n_cls, n_roi, pool, nb
         self.anat_tokens = anat_tokens and n_anat > 0
+        self.n_anat = n_anat
         self.lateral = nn.ModuleList([nn.Conv3d(c, dec, 1) for c in ch])
         self.zpos = nn.Parameter(torch.zeros(len(ch), dec, frames)) if zpos else None
         self.blocks = nn.ModuleList([block3d(dec) for _ in ch])
         self.seg_layers = nn.ModuleList([nn.Conv3d(dec, n_roi, 1) for _ in ch])
         self.anat_layers = nn.ModuleList([nn.Conv3d(dec, n_anat, 1) for _ in ch]) if n_anat else None
-        self.plane_embed = nn.Embedding(len(PLANES), dim)
+        # seq_embed: the "plane" index also encodes the sequence, plane + 3 x (2 x fluid-sensitive + fat-suppressed)
+        # (mt3d.train.plane_index), so the model is told what bright marrow means on this series.
+        self.plane_embed = nn.Embedding(len(PLANES) * (4 if seq_embed else 1), dim)
         self.glob = nn.Sequential(nn.Linear(2 * ch[-1], dim), nn.GELU(), nn.LayerNorm(dim))
         self.tok = nn.Sequential(nn.Linear(len(ch) * dec, dim), nn.GELU(), nn.LayerNorm(dim))
-        n_tok = n_cls + (n_anat if self.anat_tokens else 0)
+        # Findings without an ROI (n_cls > 8): extra_head "union" gives each a token pooled under the union of
+        # the ROI masks; "attn" gives each a learned query attending over the 8 ROI tokens + the global token.
+        self.extra_head = extra_head if n_cls > n_roi else "union"
+        n_tok = (n_cls if self.extra_head == "union" else n_roi) + (n_anat if self.anat_tokens else 0)
+        if self.extra_head == "attn":
+            self.x_query = nn.Parameter(torch.randn(n_cls - n_roi, dim) * dim ** -0.5)
+            self.x_key = nn.Linear(dim, dim)
         self.roi_embed = nn.Parameter(torch.randn(n_tok, dim) * 0.02)
         self.tf = nn.TransformerEncoder(nn.TransformerEncoderLayer(dim, 8, 2 * dim, dropout=0.1, batch_first=True,
                                                                    norm_first=True), tf_layers) if tf_layers else None
@@ -91,6 +139,16 @@ class Hybrid(nn.Module):
             self.aux_w = nn.Parameter(torch.zeros(len(self.aux_roi), dim))
             self.aux_b = nn.Parameter(torch.zeros(len(self.aux_roi)))
             nn.init.xavier_uniform_(self.aux_w)
+        # OrthoFoundation frozen features (`mt3d.ortho`, joint crops: per frame CLS, mean, 8 ROI-pooled
+        # tokens), `ortho`: "fuse" adds them (frame-averaged, projected) to the global / ROI tokens (input);
+        # "dist" predicts them from the tokens before the transformer (auxiliary target, distillation).
+        self.ortho = ortho
+        if ortho == "fuse":
+            self.o_roi = nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, dim))
+            self.o_glob = nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, dim))
+        elif ortho == "dist":
+            self.d_roi = nn.Linear(dim, 1024)
+            self.d_glob = nn.Linear(dim, 1024)
         # Report head (`PairHybrid` only): the study token -> the report's text embedding (`mt3d.reports`).
         self.rep_head = nn.Linear(dim, rep_dim) if rep_dim else None
         # Zoom branch: per ROI in `zoom`, its own 2.5D crop through the same encoder (see `zoom_tokens`).
@@ -138,7 +196,7 @@ class Hybrid(nn.Module):
         w = self.zoom_attn(v).softmax(2)
         return self.zoom_proj((w * v).sum(2))
 
-    def forward(self, x, plane, boxes=None, offset=None, tokens_only=False):
+    def forward(self, x, plane, boxes=None, offset=None, tokens_only=False, ortho=None):
         """x (B, 1, D, S, S) in [0, 1] -> dict(cls (B, n_cls), seg / anat [per level (B, k, frames, h, w)], meta).
 
         `boxes` (B, 8, D, S, S): the ROI U-Net's boxes, drawn (and augmented) like the image; with
@@ -174,7 +232,7 @@ class Hybrid(nn.Module):
             segs.append(seg)
             w = F.adaptive_avg_pool3d(boxes, seg.shape[2:]) if self.pool == "box" else torch.sigmoid(seg.float())
             ws = [w]
-            if self.n_cls > self.n_roi:                                # findings without an ROI: the union
+            if self.n_cls > self.n_roi and self.extra_head == "union":  # findings without an ROI: the union
                 ws.append(w.amax(1, keepdim=True).expand(-1, self.n_cls - self.n_roi, *w.shape[2:]))
             if self.anat_layers is not None:
                 a = self.anat_layers[i](h)
@@ -191,20 +249,41 @@ class Hybrid(nn.Module):
         else:
             t = self.tok(pooled)
         t = t + self.roi_embed[None] + self.plane_embed(plane)[:, None]
+        extra = {}
+        if self.ortho == "fuse":
+            o = ortho.float()                                              # B 16 10 1024
+            t = torch.cat([t[:, :8] + self.o_roi(o[:, :, 2:].mean(1)).to(t.dtype), t[:, 8:]], 1)
+            g = g + self.o_glob(o[:, :, 0].mean(1))
+        elif self.ortho == "dist":
+            extra = {"dist_roi": self.d_roi(t[:, :8].float()), "dist_glob": self.d_glob(g.float())}
         if self.zoom:
             # Gated (starts at 0) so the zoomed view is added to its ROI token progressively.
             zt = self.zoom_tokens(x, boxes) * self.zoom_gate[None]
             t = t.index_add(1, torch.tensor(self.zoom, device=t.device), zt.to(t.dtype))
         t = torch.cat([g[:, None], t], 1)
         if tokens_only:                                                # for `PairHybrid`: tokens before the transformer
-            return {"tokens": t, "seg": segs, "anat": anat, "meta": self.meta(g)}
+            return {"tokens": t, "seg": segs, "anat": anat, "meta": self.meta(g)} | extra
         if self.tf is not None:
             t = self.tf(t)
-        cls = (self.drop(t[:, 1:1 + self.n_cls]) * self.cls_w).sum(-1) + self.cls_b
-        out = {"cls": cls, "seg": segs, "anat": anat, "meta": self.meta(g)}
+        cls = self.logits(t)
+        out = {"cls": cls, "seg": segs, "anat": anat, "meta": self.meta(g)} | extra
         if self.aux_roi:
             out["aux"] = self.aux_logits(t)
         return out
+
+    def logits(self, t):
+        """t (..., tokens, dim) after the transformer -> (..., n_cls): ROI findings from their own tokens; the
+        findings without an ROI from their token ("union") or by attention over the ROI + global tokens ("attn")."""
+        if self.extra_head != "attn":
+            return (self.drop(t[..., 1:1 + self.n_cls, :]) * self.cls_w).sum(-1) + self.cls_b
+        roi = (self.drop(t[..., 1:1 + self.n_roi, :]) * self.cls_w[:self.n_roi]).sum(-1) + self.cls_b[:self.n_roi]
+        # global + 8 ROI tokens (+ the anatomy tokens, pooled under the predicted bone / cartilage / meniscus masks)
+        ctx = t[..., :1 + self.n_roi + (self.n_anat if self.anat_tokens else 0), :]
+        att = torch.einsum("ed,...kd->...ek", self.x_query.to(ctx.dtype), self.x_key(ctx)) / ctx.shape[-1] ** 0.5
+        self.last_attn = att.softmax(-1).detach()                            # (..., n_extra, 9), for inspection
+        pooled = torch.einsum("...ek,...kd->...ed", att.softmax(-1), ctx)
+        extra = (self.drop(pooled) * self.cls_w[self.n_roi:]).sum(-1) + self.cls_b[self.n_roi:]
+        return torch.cat([roi, extra], -1)
 
     def aux_logits(self, t):
         """t (..., tokens, dim) after the transformer -> (..., n_aux): each target from its ROI's token."""
@@ -226,9 +305,9 @@ class PairHybrid(nn.Module):
         # (each token already carries its series' plane embedding).
         self.slot_embed = nn.Parameter(torch.zeros(slots, dim)) if slots == 2 else None
 
-    def forward(self, x, plane, boxes, valid):
+    def forward(self, x, plane, boxes, valid, ortho=None):
         """x (B * slots, 1, D, S, S) slot-major per study, valid (B, slots) bool."""
-        out = self.base(x, plane, boxes, tokens_only=True)
+        out = self.base(x, plane, boxes, tokens_only=True, ortho=ortho)
         t = out["tokens"]
         n, k, dim = t.shape
         m = self.slots
@@ -241,7 +320,7 @@ class PairHybrid(nn.Module):
         if b.tf is not None:
             t = b.tf(t, src_key_padding_mask=pad)
         t = t.reshape(n // m, m, k, dim)
-        logit = (b.drop(t[:, :, 1:1 + b.n_cls]) * b.cls_w).sum(-1) + b.cls_b      # B slots n_cls
+        logit = b.logits(t)                                                      # B slots n_cls
         w = valid.float()[..., None]
         out["cls"] = (logit * w).sum(1) / w.sum(1)
         if b.aux_roi:

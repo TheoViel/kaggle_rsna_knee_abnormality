@@ -9,7 +9,16 @@ the 58 radiologist-labelled studies + the classifier's holdout.
 import argparse
 import json
 import os
+import runpy
+import sys
 import warnings
+
+if "--run_main_crops" in sys.argv:
+    # Queue convenience (mt3d/queue.sh launches main_mt3d.py): `--run_main_crops <args>` runs main_crops.py instead.
+    sys.argv.remove("--run_main_crops")
+    sys.argv[0] = "main_crops.py"
+    runpy.run_path("main_crops.py", run_name="__main__")
+    sys.exit(0)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
@@ -36,6 +45,21 @@ DEFAULTS = {
     "levels": "1,2,3", "anat_tokens": False, "zpos": False, "nb": 1,
     "findings": "roi8", "labels_extra": "mean", "zoom": "", "zoom_size": 128, "zoom_frames": 8,
     "pair": False, "slots": 2, "mixup": 0.0,
+    # backbone "ortho" (OrthoFoundation ViT-L): blocks below `freeze` frozen, gradient checkpointing.
+    "freeze": 0, "ckpt": False, "llrd": 0.0,
+    # OrthoFoundation frozen joint-crop features (output/bis/ortho/joint.npy): "fuse" (input) or "dist" (target).
+    "ortho": "", "w_dist": 1.0,
+    # Distillation pretraining: every series of ours + the external joint-crop sets (`--extra_crops`, no labels
+    # needed), losses: distillation (`--ortho dist`) + box segmentation; then fine-tune with `--init`.
+    "distill_pretrain": False,
+    # Findings without an ROI (--findings all12): "union" token or "attn" (attention over the ROI tokens).
+    "extra_head": "union",
+    # Per-finding weights of the classification loss, e.g. "Contusion:3" (others 1).
+    "cls_weights": "",
+    "seq_embed": False,             # sequence-aware plane embedding (fluid-sensitive, fat-suppressed flags)
+    # Out-of-fold teachers for pseudo-labels: train without fold `oof_fold` (of `oof_n`, by study, among the
+    # training studies) and predict it together with the usual validation studies (val_study_preds.csv).
+    "oof_fold": -1, "oof_n": 5,
     # OAI pretraining (`--pretrain oai_u10_d32_s256`): train on the OAI joint crops, with the ROI findings
     # from MOAKS (output/oai/labels_moaks00.csv) and the 25 MOAKS gradings, each tied to its ROI
     # (aux_moaks00.csv, weight w_aux); validation stays on our studies (a transfer test). Fine-tuning:
@@ -91,14 +115,29 @@ def main():
         create_logger(directory=args.output_dir, name="logs.txt")
         json.dump(vars(args), open(os.path.join(args.output_dir, "args.json"), "w"), indent=4, default=str)
 
-    arr, boxes, info = load_crops(args.crops)
+    if "," in args.crops:
+        # Several joint-crop sets of our studies (e.g. + axial: u10_d32_s256,u10_d32_s256_axial), our labels for all;
+        # the first is "main" (anatomy / OrthoFoundation features, if used, exist for it only).
+        names = args.crops.split(",")
+        arr, boxes, info = concat_sources([("main" if k == 0 else n, *load_crops(n)) for k, n in enumerate(names)])
+    else:
+        arr, boxes, info = load_crops(args.crops)
     info = info[info.Anatomical_Plane.isin(args.planes.split(","))]
     studies, _ = load_tables()
     _, gt_ids, hold_ids = make_splits(studies, holdout_frac=0.1, seed=0)
     val_mask = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
+    if args.oof_fold >= 0:
+        import numpy as _np
+        tr_st = sorted(set(info.StudyInstanceUID[~val_mask]))
+        fold = dict(zip(tr_st, _np.random.default_rng(0).permutation(len(tr_st)) % args.oof_n))
+        in_fold = info.StudyInstanceUID.map(fold).eq(args.oof_fold)
+        # The fold joins the validation side: not trained on, predicted (scores mix in these studies).
+        val_mask = val_mask | in_fold
     # roi8: the 8 ROI findings; all12: + effusion, synovitis, contusion, fracture (no ROI; `labels_extra`,
     # since the pseudo-labels cover the ROI findings only), scored as extra tasks of the same model.
     classes = list(ROI_CLASSES) + ([c for c in CLASSES if c not in ROI_CLASSES] if args.findings == "all12" else [])
+    w_map = dict((kv.split(":")[0], float(kv.split(":")[1])) for kv in args.cls_weights.split(",") if kv)
+    args.cls_w_vec = [w_map.get(c, 1.0) for c in classes]
     targets = training_targets(args.labels, studies, ROI_CLASSES)
     if len(classes) > len(ROI_CLASSES):
         targets |= training_targets(args.labels_extra, studies, classes[len(ROI_CLASSES):])
@@ -112,7 +151,7 @@ def main():
     else:
         train_ds = MTDataset(arr, boxes, info[~val_mask], targets, classes, anatomy=anatomy)
     val_ds = MTDataset(arr, boxes, info[val_mask], training_targets("claude", studies, classes), classes)
-    if args.extra_crops:
+    if args.extra_crops and not args.distill_pretrain:
         tr_info = info[~val_mask]
         sources = [("main", arr, boxes, tr_info)]
         ext_targets = {c: pd.Series(dtype=float) for c in classes}
@@ -134,6 +173,21 @@ def main():
         train_ds = MTDataset(a_arr, a_boxes, a_info, all_targets, classes, anatomy=anatomy)
         if ctx.is_main:
             print(f"- + external: {', '.join(f'{n} {len(i)} series' for n, _, _, i in sources[1:])}")
+    if args.distill_pretrain:
+        # Our training studies (validation excluded: its images stay unseen) + external sets, labels dropped.
+        names = [n for n in args.extra_crops.split(",") if n]
+        sources = [("main", arr, boxes, info[~val_mask])] + [(n, *load_crops(n)) for n in names]
+        a_arr, a_boxes, a_info = concat_sources(sources)
+        train_ds = MTDataset(a_arr, a_boxes, a_info, {c: pd.Series(dtype=float) for c in classes}, classes)
+    if args.ortho:
+        from mt3d.ortho import ORTHO_DIR
+        o_feats = {"main": np.load(os.path.join(ORTHO_DIR, "joint.npy"), mmap_mode="r")}
+        for n in [n for n in args.extra_crops.split(",") if n]:
+            f = os.path.join(ORTHO_DIR, f"joint_{n}.npy")
+            if os.path.exists(f):
+                o_feats[n] = np.load(f, mmap_mode="r")
+        train_ds.ortho = o_feats
+        val_ds.ortho = o_feats["main"]
     if args.w_rep > 0 and not args.pretrain:
         from mt3d.reports import report_targets
         train_ds.y_rep = report_targets(set(train_ds.info.StudyInstanceUID), args.rep_dim).reindex(
@@ -169,7 +223,9 @@ def main():
                        n_cls=len(classes), levels=[int(v) for v in args.levels.split(",")],
                        anat_tokens=args.anat_tokens, zpos=args.zpos, nb=args.nb,
                        zoom=zoom_rois(args.zoom), zoom_size=args.zoom_size, zoom_frames=args.zoom_frames,
-                       aux_roi=aux_roi, rep_dim=args.rep_dim if args.w_rep > 0 else 0).to(ctx.device)
+                       aux_roi=aux_roi, rep_dim=args.rep_dim if args.w_rep > 0 else 0,
+                       freeze=args.freeze, ckpt=args.ckpt, ortho=args.ortho, extra_head=args.extra_head,
+                       seq_embed=args.seq_embed).to(ctx.device)
     else:
         model = MT3D(n_dec=args.n_dec, head=args.head, dim=args.dim, tf_layers=args.tf_layers, dropout=args.dropout,
                      queries=args.queries, pretrained=args.pretrained, detach_masks=args.detach_masks,

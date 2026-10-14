@@ -143,6 +143,10 @@ $P --name oai_axial_mid   --volumes ../output/oai/volumes_axial.csv --boxes ../o
 | Joint training with OAI axial (DESS reformat) crops for PF OA | **PF OA −0.014 on both**, whatever the PF label. The axial reformats are the problem |
 | **MOAKS multi-task pretraining → fine-tuning** | OA models: medial OA +0.002 to +0.017, PF OA +0.014 to +0.026 on the 58 in all 6 OA models; lateral OA +0.003 to +0.013 on the holdout. "All" model 0.952 / 0.943–0.945 vs 0.946 / 0.942 (2 seeds). Menisci CoAtNet: within seed range. 20-epoch pretraining = 10 epochs |
 | Multi-task joint training (`oa_moaks`, `all_moaks`, OAI weight 0.25) | about the same as pretraining then fine-tuning: OA 0.921 / 0.932 and 0.910 / 0.928 (2 seeds) vs 0.917 / 0.928 |
+| Synovitis: OAI-only model, OAI pseudo-labels, noisy-OR (2026-10-13) | **adopted.** OAI-only 0.878 on the 58 vs b1_c1 0.851. Noisy-OR of the report label and the OAI pseudo-label: 4 models 0.885, + b1_c1 0.889. Details: `output/synovitis_share/README.md`, `output/dataset_6/readme.md` |
+| Contusion from bone marrow lesions, OAI-only (`oai.labels --bml`: 0.5 × largest BML size / 3, run 2026-10-13/81) | **0.557** on the 58. OAI BMLs are degenerative; they do not teach impact contusion |
+| Contusion: OAI BML model → fine-tune (`cc` setup, run 83) | 0.933 / 0.949 vs 0.947 / 0.956 (seed-0 reference 2026-10-12/58): regression, discarded |
+| Fracture: MOAKS pretraining (ConvNeXt-tiny, ROI crops, run 82) → fine-tune (`fr9` setup, run 84) | 0.946 / 0.916 vs 0.960 / 0.952 (seed-0 reference 2026-10-12/25): regression, discarded. OAI has no fracture grading |
 | Recipe level (`dataset_6` recipe) | adding MOAKS-pretrained OA models gives 0.9624 / 0.9501 vs 0.9610 / 0.9498: noise level |
 
 **MOAKS pretraining recipe** (run `logs/crops_run/2026-10-11/8`, used by `dataset_2_moaks`):

@@ -36,6 +36,7 @@ from roi.extract import ROI_CLASSES
 from training.distributed import all_gather_lists, all_reduce_mean, unwrap_model
 
 CROP_DIR = os.path.join(OUTPUT_FOLDER, "crops")
+BONE_ROIS = ["Medial Femur", "Lateral Femur", "Medial Tibia", "Lateral Tibia"]       # fracture.bones
 GROUPS = {
     "acl": ["ACL"], "mcl": ["MCL"], "ligaments": ["ACL", "MCL"],
     "menisci": ["Medial Meniscus", "Lateral Meniscus"],
@@ -49,6 +50,9 @@ GROUPS = {
     "contusion_cap": ["Contusion"],                 # whole-joint (capsule) crop, study label
     # Both tibiofemoral compartments from one crop that shows both (single-crop sets).
     "tf": ["Medial OA", "Lateral OA"],
+    # One OA compartment per model (src_bis/train_group.py; OA overnight 2026-10-14, src_bis/OA_README.md): the encoder
+    # cannot share "arthritic knee" features learned from the other compartments' targets.
+    "pf_oa": ["PF OA"], "lateral_oa": ["Lateral OA"], "medial_oa": ["Medial OA"],
     # MOAKS gradings for multi-task pretraining on OAI ("<ROI>|<feature>", see oai.labels.aux_targets).
     "moaks_aux": ['Medial OA|cart_size', 'Medial OA|cart_full', 'Medial OA|cart_sum', 'Medial OA|bml', 'Lateral OA|cart_size', 'Lateral OA|cart_full', 'Lateral OA|cart_sum', 'Lateral OA|bml', 'PF OA|cart_size', 'PF OA|cart_full', 'PF OA|cart_sum', 'PF OA|bml', 'Medial Meniscus|tear', 'Medial Meniscus|maceration', 'Medial Meniscus|signal', 'Medial Meniscus|extrusion', 'Lateral Meniscus|tear', 'Lateral Meniscus|maceration', 'Lateral Meniscus|signal', 'Lateral Meniscus|extrusion', 'ACL|tear', 'Medial OA|osteophyte', 'Lateral OA|osteophyte', 'PF OA|osteophyte', "Baker's|cyst"],
 }
@@ -62,6 +66,8 @@ GROUPS.update({
     "fracture_roi": [f"{c}|fracture" for c in ROI_CLASSES],
     # + the fibular-head crop (crop sets f9_*, fracture.fibula; labels fracture.roi_labels --fibula)
     "fracture_roi9": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"]],
+    # + the 4 bone crops (crop sets f13_*, fracture.bones; labels fracture.roi_labels --fibula --bones)
+    "fracture_roi13": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"] + BONE_ROIS],
     # Contusion per ROI (fracture.roi_labels --finding contusion), alone or with fracture on the same 9 crops.
     "contusion_roi9": [f"{c}|contusion" for c in ROI_CLASSES + ["Fibula"]],
     "contusion_roi": [f"{c}|contusion" for c in ROI_CLASSES],          # 8 ROIs (crop sets without the fibula)
@@ -78,6 +84,8 @@ def crop_index(c, single=False):
         c = c.split("|")[0]
     if c == "Fibula":                 # ninth crop of the f9_* crop sets (fracture.fibula)
         return len(ROI_CLASSES)
+    if c in BONE_ROIS:                # crops 10-13 of the f13_* crop sets (fracture.bones)
+        return len(ROI_CLASSES) + 1 + BONE_ROIS.index(c)
     return 0 if single or c in CAPSULE_FINDINGS else ROI_CLASSES.index(c)
 PLANES = ["Sagittal", "Coronal", "Axial"]
 

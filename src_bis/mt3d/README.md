@@ -210,3 +210,68 @@ Two fp16 overflows fixed in `mt3d/hybrid.py`: the masked pooling and the token p
 - **`recipe.json` (default, the user's choice):** each of the 4 hybrids is one member of every ROI finding's rank average (0.945 / 0.952 offline).
 - **`recipe_all8.json`:** the hybrid ensemble as one member (0.950 / 0.950).
 - **`recipe_acl_moa.json`:** the same, on ACL and medial OA only (0.958 / 0.945).
+
+## Bug found 2026-10-12: the backbone learning rate in pair / set mode
+
+`mt3d/train.py` picked the backbone parameters by name prefix `encoder`. In a `PairHybrid` they are named `base.encoder...`, so in every pair or set run the backbone trained at `--lr` (5e-4), not `--lr_unet`.
+
+- **Affected:** all set-model results above, including the 4 packaged hybrids. Their scores and their reproduction stand; they were simply trained at a higher backbone rate than their args.json says.
+- **No-op experiment:** `11/13` ("lr_unet 2e-4") changed nothing.
+- **Hurt most:** the OrthoFoundation ViT-L fine-tunes (11/73, 11/74, 12/1), which trained at 5e-4 instead of 3e-5.
+
+Fixed: `base.` is now stripped before matching. `--llrd` adds layer-wise lr decay for the ViT. Reruns with the intended rates are 12/8 onwards.
+
+## OrthoFoundation (2026-10-11/12 night)
+
+github.com/ytrsk/OrthoFoundation: a DINOv3 ViT-L/16 with continued DINO pretraining on 1.25 M knee radiographs and MRI slices (2D).
+
+**Loading and speed:**
+- Weights in `output/bis/ortho/OrthoFoudation-L.pth`. They load into timm `vit_large_patch16_dinov3` with no missing keys (`mt3d/ortho.py: load_ortho`).
+- Checked against Meta's dinov3 code: patch tokens match to 2.6e-3, against a mean magnitude of 0.21.
+- Input as in its pretraining: a grayscale slice replicated to RGB, ImageNet normalisation, 224 px.
+- About 1,500 slices/s on an H100 in fp16. On a T4, estimated 100–150/s, so about 5–7 min per model for the test set on 2 T4s.
+
+**Frozen features** (`mt3d/ortho.py` extraction, `mt3d/probe.py` attention-pooling probes; 8 ROI findings, 58 / holdout):
+
+| Input | 58 | Holdout |
+|---|---|---|
+| Joint crop, patch tokens pooled under each ROI box | 0.909 | 0.921 |
+| Main agent's 8-frame ROI crops (4× the compute) | 0.908 | 0.924 |
+| Full slices, ROI-pooled | 0.903 | 0.921 |
+| Joint crop, global CLS + mean token | 0.890 | 0.905 |
+| Generic DINOv3-L (control), joint crop, ROI-pooled | 0.868 | 0.908 |
+
+- **The knee pretraining clearly helps:** +0.036 on the 58 over generic DINOv3-L (MCL 0.905 vs 0.732).
+- **Crops vs full slices:** equivalent once pooled under the ROI boxes. Pooling under ROI regions matters (+0.02 over global tokens); zooming doesn't. The joint crop is the cheapest input.
+- **The 4 extra findings, frozen:** 0.843 / 0.913, vs the main agent's 0.911 / 0.950. Synovitis on the 58 is 0.802 vs 0.781, but its holdout is lower.
+
+**Fine-tuned** (8 ROI findings; reference: MOAKS ConvNeXt hybrid 0.937–0.941 / 0.949–0.950):
+
+| Setup | Runs | 58 | Holdout |
+|---|---|---|---|
+| Hybrid set model, blocks 12–23 trained, backbone lr 5e-4, 12–15 epochs | 11/74, 12/13 | 0.930–0.937 | 0.948–0.951 |
+| Hybrid, blocks 16–23 trained (5e-4) | 11/73 | 0.933 | 0.945 |
+| Hybrid, blocks 8–23 trained (5e-4) | 12/12 | 0.937 | 0.948 |
+| Hybrid, blocks 12–23 at 3e-5 / all blocks with layer-wise decay (5e-5) | 12/8, 12/9 | 0.931 / 0.929 | 0.944 / 0.940 |
+| Main agent's 2.5D ROI-crop "all" model with OrthoFoundation, 4 epochs | bis/crops_run/2026-10-12/0 | 0.938 | 0.936 |
+| Hybrid, all 12 findings | 12/1 | 0.937 (extras 0.887) | 0.946 (extras 0.936) |
+
+- **2D vs 3D:** the model is 2D. It works best per frame, with 3D context added on top: the 3D FPN, masked pooling, and the transformer across frames and series.
+- **Learning rate:** it needs a high backbone rate (5e-4 on blocks 12–23). Low rates and layer-wise decay are worse: the self-supervised features need real adaptation.
+- **Best result:** fine-tuned, it reaches the ConvNeXt hybrids (0.951 holdout) but doesn't beat them.
+
+**Uses as a teacher** (all on the MOAKS ConvNeXt set recipe, 2 seeds where listed):
+
+| Use | Runs | 58 | Holdout | Verdict |
+|---|---|---|---|---|
+| Distillation: ROI tokens predict its ROI-pooled tokens (`--ortho dist`) | 11/75, 11/77 | 0.933–0.938 | 0.946–0.949 | neutral |
+| Fusion: its frozen tokens as input (`--ortho fuse`) | 11/76, 12/0 | 0.932–0.937 | 0.947–0.949 | neutral |
+| Distillation pretraining on ours + OAI + MRNet + SKM-TEA, then fine-tune | 12/5, 12/6 | 0.929–0.930 | 0.942–0.944 | worse |
+| Pseudo-labels: 5-fold OOF probes mixed into pl_round2 at 25% / 50% | 12/2, 12/3 | 0.935 / 0.936 | 0.949 / 0.947 | neutral |
+
+**Ensembles:**
+- OrthoFoundation × 2 added to the hybrids: 0.941 / 0.953, vs 0.941 / 0.952.
+- Added to the submitted recipe: 0.947 / 0.952, vs 0.949 / 0.951.
+- Within noise, so not worth its inference cost.
+
+**Conclusion:** OrthoFoundation is a much better frozen feature extractor than generic DINOv3. But once fine-tuned on our ~4k labelled studies it reaches, without beating, the CNN hybrids, and it adds no ensemble diversity. The likely limit is the labels (report-derived soft targets), not the features.
