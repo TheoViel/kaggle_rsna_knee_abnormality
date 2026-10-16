@@ -738,16 +738,19 @@ def combine(preds, recipe, studies):
     tab = {m: g.pivot(index="StudyInstanceUID", columns="cls", values="p") for m, g in preds.groupby("model")}
     study = pd.DataFrame(index=pd.Index(studies, name="StudyInstanceUID"))
 
+    def rank_mean(cols):
+        """Mean of the members' ranks over the studies each member predicts; a study missing from some members
+        (e.g. no axial series for an axial-only model) gets the mean of the others, NaN only if none predict it."""
+        return cols[0] if len(cols) == 1 else pd.concat([col.rank(pct=True) for col in cols], axis=1).mean(axis=1)
+
     def member(m, c):
         """A model's column, or a nested list's mean rank (a seed group / sub-ensemble counted as one member)."""
         if isinstance(m, list):
-            cols = [member(x, c) for x in m]
-            return cols[0] if len(cols) == 1 else sum(col.rank(pct=True) for col in cols) / len(cols)
+            return rank_mean([member(x, c) for x in m])
         return tab[m][c].reindex(study.index) if m in tab and c in tab[m] else pd.Series(np.nan, index=study.index)
 
     for c, r in recipe.items():
-        cols = [member(m, c) for m in r["models"]]
-        study[c] = cols[0] if len(cols) == 1 else sum(col.rank(pct=True) for col in cols) / len(cols)
+        study[c] = rank_mean([member(m, c) for m in r["models"]])
     base = study.copy()
     for c, r in recipe.items():
         if r["minus"]:
@@ -788,7 +791,15 @@ def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_
     sub = pd.DataFrame({"StudyInstanceUID": studies})
     for c in CLASSES:
         sub[c] = sub.StudyInstanceUID.map(study[c]) if c in study else np.nan
-    sub[CLASSES] = sub[CLASSES].fillna(0.5)                                  # uncovered findings / studies
+    # Studies the recipe could not predict (no crops: e.g. no sagittal / coronal series, unreadable DICOMs): the
+    # finding's median over the other studies, a neutral value on its own scale (raw probability or mean rank);
+    # roi_study_preds.csv keeps them NaN for the notebook's per-study b1_c1 fallback. Uncovered findings: 0.5.
+    for c in CLASSES:
+        n = int(sub[c].isna().sum())
+        if n and sub[c].notna().any():
+            print(f"  {c}: {n} studies without a prediction -> median")
+            sub[c] = sub[c].fillna(sub[c].median())
+    sub[CLASSES] = sub[CLASSES].fillna(0.5)
     sub.to_csv(submission, index=False)
     print(f"-> {submission}: {len(sub)} studies, recipe covers {list(recipe)} (0.5 elsewhere), "
           f"{time.time() - t0:.0f}s in total")
