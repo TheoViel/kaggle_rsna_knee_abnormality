@@ -367,7 +367,14 @@ class Models:
         if study_names:
             from infer import study_models
             self.studies, self.study_encoders = study_models.load(weights, study_names, device)
-        for m in sorted({x.split("@")[0] for x in refs}):
+        # "<name>" under <weights>/embheads/: a head on frozen crop-model features (infer.emb_heads); its source crop
+        # models run as usual and also keep the features of the crops it reads (also when the recipe does not use them).
+        emb_names = {x.split("@")[0] for x in refs if os.path.isdir(os.path.join(weights, "embheads", x.split("@")[0]))}
+        self.emb_heads, self.emb_needs = [], {}
+        if emb_names:
+            from infer import emb_heads
+            self.emb_heads, self.emb_needs = emb_heads.load(weights, emb_names, device)
+        for m in sorted(({x.split("@")[0] for x in refs} - emb_names) | set(self.emb_needs)):
             if m == "shared8" or m in study_names:
                 continue
             if os.path.isdir(os.path.join(weights, "mt3d", m)):
@@ -386,6 +393,7 @@ class Models:
             if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
                 net = net.to(memory_format=torch.channels_last)
             takes = {f for f, r in recipe.items() if any(x.split("@")[0] == m for x in flat(r["models"]))}   # findings from it
+            takes |= self.emb_needs.get(m, set())                # crops read by embedding heads
             aux = finding_of(a["aux"]) if a.get("aux") else None
             if aux in takes:          # auxiliary per-ROI output (e.g. fracture): needs every ROI crop of the model
                 used = list(group)
@@ -558,6 +566,7 @@ def process_chunk(studies, models, timer):
 
     # Crop models: every (series, ROI) of the planes and findings each one is used for.
     out = []
+    emb_store = {}                        # (model, series, class) -> (crop vector, frame features), for embedding heads
     for m in models.crops if crop_rows else []:
         t = time.time()
         x_all, have = crops[m["z"]]
@@ -569,9 +578,19 @@ def process_chunk(studies, models, timer):
             part = items[i:i + nb]
             j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
             x = _padded(x_all[j, roi], nb).float() / 255
+            need = models.emb_needs.get(m["name"], set())
             with torch.autocast(**amp):
-                p = torch.sigmoid(m["net"](x, _padded(rid, nb), _padded(pl, nb),
-                                           **({"both": True} if m["aux"] else {})).float())
+                if any(c in need for *_, c in part):          # the same pass, also returning the features
+                    from infer import emb_heads
+                    assert not m["aux"], "embedding heads on auxiliary-output crop models are not supported"
+                    lg, e, f0 = emb_heads.forward_with_features(m["net"], x, _padded(rid, nb), _padded(pl, nb))
+                    p = torch.sigmoid(lg.float())
+                    for i_, (j_, *_, c) in enumerate(part):
+                        if c in need:
+                            emb_store[(m["name"], crop_rows[j_]["SeriesInstanceUID"], c)] = (e[i_].float(), f0[i_].float())
+                else:
+                    p = torch.sigmoid(m["net"](x, _padded(rid, nb), _padded(pl, nb),
+                                               **({"both": True} if m["aux"] else {})).float())
             if m["aux"]:              # (main, auxiliary) per item; the auxiliary row is "<finding>|<aux>"
                 p, p2 = p[:, 0], p[:, 1]
                 out += [(m["name"], st, f"{c}|{m['aux']}", m["planes_all"][pl_], float(v))
@@ -584,6 +603,11 @@ def process_chunk(studies, models, timer):
         dt = time.time() - t
         timer["models"] += dt
         timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
+    if models.emb_heads and emb_store:    # embedding heads (infer.emb_heads) on the features kept above
+        from infer import emb_heads
+        t = time.time()
+        out += emb_heads.predict(models.emb_heads, emb_store, crop_rows, dev)
+        timer["models"] += time.time() - t
     # Hybrid models: joint crops cut once from the same caches and consensus boxes, shared by all of them.
     if models.hybrids and len(rois):
         t = time.time()
