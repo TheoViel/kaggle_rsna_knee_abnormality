@@ -37,6 +37,7 @@ from training.distributed import all_gather_lists, all_reduce_mean, unwrap_model
 
 CROP_DIR = os.path.join(OUTPUT_FOLDER, "crops")
 BONE_ROIS = ["Medial Femur", "Lateral Femur", "Medial Tibia", "Lateral Tibia"]       # fracture.bones
+EXTRA_ROIS = ["Patella", "Tibial Tuberosity", "Fibula Shaft"]                         # fracture.extra
 GROUPS = {
     "acl": ["ACL"], "mcl": ["MCL"], "ligaments": ["ACL", "MCL"],
     "menisci": ["Medial Meniscus", "Lateral Meniscus"],
@@ -68,6 +69,8 @@ GROUPS.update({
     "fracture_roi9": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"]],
     # + the 4 bone crops (crop sets f13_*, fracture.bones; labels fracture.roi_labels --fibula --bones)
     "fracture_roi13": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"] + BONE_ROIS],
+    # + whole patella, tibial tuberosity, fibular neck / shaft (crop sets f16_*, fracture.extra; labels --extra3)
+    "fracture_roi16": [f"{c}|fracture" for c in ROI_CLASSES + ["Fibula"] + BONE_ROIS + EXTRA_ROIS],
     # Contusion per ROI (fracture.roi_labels --finding contusion), alone or with fracture on the same 9 crops.
     "contusion_roi9": [f"{c}|contusion" for c in ROI_CLASSES + ["Fibula"]],
     "contusion_roi": [f"{c}|contusion" for c in ROI_CLASSES],          # 8 ROIs (crop sets without the fibula)
@@ -86,6 +89,8 @@ def crop_index(c, single=False):
         return len(ROI_CLASSES)
     if c in BONE_ROIS:                # crops 10-13 of the f13_* crop sets (fracture.bones)
         return len(ROI_CLASSES) + 1 + BONE_ROIS.index(c)
+    if c in EXTRA_ROIS:               # crops 14-16 of the f16_* crop sets (fracture.extra)
+        return len(ROI_CLASSES) + 1 + len(BONE_ROIS) + EXTRA_ROIS.index(c)
     return 0 if single or c in CAPSULE_FINDINGS else ROI_CLASSES.index(c)
 PLANES = ["Sagittal", "Coronal", "Axial"]
 

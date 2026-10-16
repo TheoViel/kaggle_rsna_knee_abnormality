@@ -13,7 +13,7 @@ import json
 import os
 
 SKIP = {"output_dir", "log_path", "z_sampling", "augmentations", "fullfit", "n_folds", "fold", "seed"}
-TWO_GPU = {"sy0", "sy1", "ef1"}            # package models trained on 2 GPUs (batch already per 2 GPUs)
+TWO_GPU = {"sy0", "sy1", "ef1", "fb0", "fb1", "ax0", "lc0", "lc1", "lc2"}   # package models trained on 2 GPUs (batch already per 2 GPUs)
 
 
 def normalised(a):

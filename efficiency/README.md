@@ -21,6 +21,36 @@ At those values, 0.001 of AUC is worth about 70 s of runtime.
 | Models | 10 crop models, rank-averaged | one model per finding; the joint model's encoder runs once per crop for its 4 findings (embeddings enter after the encoder) |
 | pip | 4 wheels installed | none: the U-Net architecture is vendored; JPEG decoders are installed from the wheels dataset only if a compressed DICOM appears |
 
+## Series selection and fallbacks
+
+Each study has two slots, Sagittal and Coronal, each with a ranked candidate list (`list_series`):
+1. series the csv labels with that plane, fluid-sensitive first, then by SeriesInstanceUID;
+2. series without a plane label;
+3. the study's other series, e.g. mislabelled axials, as a last resort.
+
+`read_study` keeps, per slot, the first candidate that:
+- reads correctly;
+- has at least 5 slices;
+- has DICOM geometry matching the slot's plane. When the geometry is unreadable, the slot's plane is assumed.
+
+A series rejected for one slot can fill the other. A slot with no usable candidate is left empty, so the worst case is one series in one view. A study with nothing usable gets 0.5 for every finding.
+
+When a weak U-Net box (peak below 0.5) can't be replaced by registration from the knee's other series, as with a lone series, it is kept instead of dropping that ROI.
+
+On the train set, csv planes agree with the DICOM geometry for 1,500/1,500 sampled series, and no series has fewer than 11 slices.
+
+Scenarios on the 493 validation studies (`recipe_eff`, 58 / holdout):
+
+| Series csv | Series used | Score |
+|---|---|---|
+| as given | 1 sag + 1 cor | 0.9447 / 0.9391 |
+| first-choice sagittal missing on disk | next fluid-sensitive sagittal | 0.9447 / 0.9391 |
+| no plane labels | same picks, by geometry | 0.9447 / 0.9391 |
+| sagittal / coronal labels swapped | same picks, by geometry | 0.9447 / 0.9391 |
+| no coronal series | sagittal only | 0.9427 / 0.9335 |
+| no sagittal series | coronal only | 0.9329 / 0.9310 |
+| axial series only | none: all findings 0.5 | – |
+
 ## Recipe (`recipe.json` of the weights)
 
 | Finding | Model |

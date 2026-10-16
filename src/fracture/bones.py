@@ -63,18 +63,19 @@ def _crop(job):
     import torch
 
     torch.set_num_threads(1)
-    r, boxes, cache_dir = job
+    r, boxes, cache_dir, kw = job if len(job) == 4 else (*job, dict(depth=8, z_mode="strided", stride=1))
     if not boxes:
-        return np.zeros((len(BONES), 8, 128, 128), np.uint8)
+        return np.zeros((len(BONES), kw["depth"], 128, 128), np.uint8)
     cache = np.load(os.path.join(cache_dir, f"{r['SeriesInstanceUID']}.npy"))
     return np.stack([crop_box(cache, boxes[b], r["n_slices"], r["rows"], r["cols"], r["side"] == "L",
-                              r["Anatomical_Plane"] == "Sagittal", depth=8, size=128, margin=0.25,
-                              z_mode="strided", stride=1) for b in BONES])
+                              r["Anatomical_Plane"] == "Sagittal", size=128, margin=0.25, **kw) for b in BONES])
 
 
-def jobs(info, bx, cache_dir=CACHE_DIR):
+def jobs(info, bx, cache_dir=CACHE_DIR, kw=None):
+    """kw: through-plane sampling (the base crop set's, see main); f_s1n8's by default."""
+    kw = kw or dict(depth=8, z_mode="strided", stride=1)
     return [(r, bone_boxes(bx.get(r["SeriesInstanceUID"], {}), r["Anatomical_Plane"], r["rows"], r["cols"], r["n_slices"]),
-             cache_dir) for r in info.to_dict("records")]
+             cache_dir, kw) for r in info.to_dict("records")]
 
 
 def main():
@@ -108,15 +109,15 @@ def main():
         n0 = base.shape[1]
         arr = np.lib.format.open_memmap(os.path.join(CROP_DIR, f"{a.name}.npy"), mode="w+", dtype=np.uint8,
                                         shape=(base.shape[0], n0 + len(BONES), *base.shape[2:]))
-        js = jobs(info, bx, a.cache_dir)
-        n_none = sum(not b for _, b, _ in js)
+        meta = json.load(open(os.path.join(CROP_DIR, f"{a.base}.json")))
+        js = jobs(info, bx, a.cache_dir, {k: meta[k] for k in ("depth", "z_mode", "stride") if k in meta})
+        n_none = sum(not b for _, b, _, _ in js)
         with ProcessPoolExecutor(96) as ex:
             for i, c in enumerate(ex.map(_crop, js, chunksize=16)):
                 arr[i, :n0] = base[i]
                 arr[i, n0:] = c
         arr.flush()
         info.to_csv(os.path.join(CROP_DIR, f"{a.name}.csv"), index=False)
-        meta = json.load(open(os.path.join(CROP_DIR, f"{a.base}.json")))
         json.dump({**meta, "bones": True}, open(os.path.join(CROP_DIR, f"{a.name}.json"), "w"))
         print(f"-> {a.name}: {arr.shape}; {n_none} series without bone boxes (missing ROI boxes)")
 

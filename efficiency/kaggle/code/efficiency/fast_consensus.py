@@ -35,6 +35,12 @@ def consensus(pred, rows):
     weak = pred.conf < 0.5
     knees = rows.assign(StudyInstanceUID=knee(rows), Anatomical_Plane=rows.plane)
     filled, n_filled = fill_by_registration(pred.assign(source="unet"), knees, ~weak, weak)
+    # Weak boxes nothing could replace (lone series, or no trusted box of the class in the knee): kept as they are,
+    # rather than losing the ROI (src/infer drops them; then the finding has no crop and falls back to 0.5).
+    have = set(zip(filled.SeriesInstanceUID, filled["class"]))
+    lost = pred[weak & np.array([(u, c) not in have for u, c in zip(pred.SeriesInstanceUID, pred["class"])], bool)]
+    if len(lost):
+        filled = pd.concat([filled, lost.assign(source="unet_weak")], ignore_index=True)
     filled["StudyInstanceUID"] = filled.StudyInstanceUID.str.split("|").str[0]
     filled["side"] = filled.SeriesInstanceUID.map(rows.set_index("SeriesInstanceUID").side)
     cols = ["StudyInstanceUID", "SeriesInstanceUID", "plane", "side", "class"] + BOX + \

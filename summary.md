@@ -42,6 +42,44 @@ The last block replaces the 4 non-ROI findings by b1_c1's predictions, the confi
 
 Note: the `dataset_2_moaks_mrnet*` rows are on a different scale from the rows above: recipe-level evaluation of the validation (non-fullfit) runs (`src/ext/recipe_eval.py`, external_data.md §6.4). On that scale `dataset_2_moaks` scores 0.957 (ACL 0.975, MCL 0.991, med. men. 0.978, lat. men. 0.945, med. OA 0.977, lat. OA 0.878, PF OA 0.923, Baker's 0.991); compare against that. The 12-finding column is left empty.
 
+### LB results reported 2026-10-14
+
+- **Synovitis:** the synovitis models, rank-blended with rank(family, b1_c1), gave **+0.001**. That submission beats everything before it.
+- **Contusion and effusion:** adding the contusion and effusion models (50/50 rank blend with b1_c1) lowered the LB slightly. Keep b1_c1 alone for both.
+- **Fracture:** the bone-crop fracture models (`dataset_9`, `fb0` / `fb1`) raised the LB slightly.
+- **Current best:** synovitis + bone-crop fracture, without the contusion and effusion models. The package for it was not built.
+- **Next A/B tests, one change each:**
+  - `dataset_11` = that best + the new lateral OA models (`lc0`–`lc2`, no correction);
+  - `dataset_12` = `dataset_11` + the PF blend (`mk90` + `mk89` + `ax0`).
+
+### Night of 2026-10-14/15: experiments
+
+All scores are on validation runs: the 58 / the holdout. The synovitis holdout is not meaningful (report convention).
+
+**Packaged:**
+
+| Package | Change | Result |
+| --- | --- | --- |
+| `dataset_13` | Synovitis ConvNeXt at 224 px (`sy224a` / `sy224b`) instead of 160 px | Synovitis 0.885 → 0.890; + rank(family, b1_c1) 0.889 → 0.893 |
+| `dataset_14` | Medial OA = 3 medial-OA-only models on Claude labels (`mo0`–`mo2`) | Medial OA 0.977 / 0.947 → 0.988 / 0.949. Same crop family as `dataset_4`, so submit it as an A/B against `dataset_13` |
+
+**Dropped:**
+
+| Experiment | Result |
+| --- | --- |
+| Cross-finding stacker over the out-of-fold predictions (`ext/stacker.py`) | Macro on the 58: 0.943 → 0.936 (Claude targets), 0.942 (own labels), 0.917 (LOO on the 58) |
+| Seed groups for ACL, MCL, menisci, medial OA, Baker's | No gain on the 58 (e.g. ACL 0.983 → 0.975); holdout ±0.002 |
+| Fracture: 16 strided / 12 uniform frames per bone crop | 0.954 / 0.954 and 0.935 / 0.955, vs 0.961 / 0.954 |
+| Fracture: 4 seeds vs 2 | 0.967 / 0.949 vs 0.961 / 0.954. Single seeds range 0.939–0.975 on the 58 |
+| Synovitis at 288 px, 16 frames | 0.873 vs 0.886 at 224 px |
+| Synovitis fat pad crop (`crops/hoffa.py`) | 0.817 alone; ensemble 0.885 → 0.872 |
+| Synovitis: effusion-synovitis as a third noisy-OR term | 0.846 |
+| Synovitis: 224 px OAI teacher | PL 0.872 vs 0.878; student 0.873 vs 0.886 |
+| CAFormer synovitis at 224 px | Out of memory at 4 × 32 |
+| Test-time augmentation (13 models, `ext/tta_eval.py`) | 58: −0.003 to −0.005 on average; holdout +0.001 |
+| Inference series aggregation (`ext/agg_eval.py`) | The mean is best: power-2 mean +0.001 / −0.001 |
+| Lateral-meniscus-only models on Claude labels | 0.918 / 0.908 alone, vs a recipe at 0.959 |
+
 What each folder contains:
 
 - **`dataset_1`:** the round-2 crop models on 12 uniform frames over each ROI box.

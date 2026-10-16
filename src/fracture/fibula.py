@@ -32,6 +32,8 @@ from crops.prepare import BOX, CROP_DIR, crop_box
 from params import CACHE_DIR, OUTPUT_FOLDER
 
 BOXES = os.path.join(OUTPUT_FOLDER, "roi", "labels", "round3_pred.csv")
+# Through-plane sampling of the extra crops: the base crop set's (its .json), set in main(); f_s1n8 by default.
+CROP_KW = dict(depth=8, z_mode="strided", stride=1)
 NEEDED = ("Medial Meniscus", "Lateral Meniscus", "Lateral OA", "PF OA", "Baker's")
 
 
@@ -81,17 +83,17 @@ def _crop(job):
     import torch
 
     torch.set_num_threads(1)
-    r, box, cache_dir = job
+    r, box, cache_dir, kw = job if len(job) == 4 else (*job, CROP_KW)
     if box is None:
-        return np.zeros((8, 128, 128), np.uint8)
+        return np.zeros((kw["depth"], 128, 128), np.uint8)
     cache = np.load(os.path.join(cache_dir, f"{r['SeriesInstanceUID']}.npy"))
     return crop_box(cache, box, r["n_slices"], r["rows"], r["cols"], r["side"] == "L", r["Anatomical_Plane"] == "Sagittal",
-                    depth=8, size=128, margin=0.25, z_mode="strided", stride=1)
+                    size=128, margin=0.25, **kw)
 
 
 def jobs(info, bx, cache_dir=CACHE_DIR):
     return [(r, fibula_box(bx.get(r["SeriesInstanceUID"], {}), r["Anatomical_Plane"], r["rows"], r["cols"], r["n_slices"]),
-             cache_dir) for r in info.to_dict("records")]
+             cache_dir, dict(CROP_KW)) for r in info.to_dict("records")]
 
 
 def main():
@@ -105,6 +107,8 @@ def main():
     p.add_argument("--cache_dir", default=CACHE_DIR)
     a = p.parse_args()
     info = pd.read_csv(os.path.join(CROP_DIR, f"{a.base}.csv"))
+    meta = json.load(open(os.path.join(CROP_DIR, f"{a.base}.json")))
+    CROP_KW.update({k: meta[k] for k in ("depth", "z_mode", "stride") if k in meta})
     bx = boxes_per_series(a.boxes)
     if a.check:
         from PIL import Image, ImageDraw
@@ -125,7 +129,7 @@ def main():
         arr = np.lib.format.open_memmap(os.path.join(CROP_DIR, f"{a.name}.npy"), mode="w+", dtype=np.uint8,
                                         shape=(base.shape[0], 9, *base.shape[2:]))
         js = jobs(info, bx, a.cache_dir)
-        n_none = sum(b is None for _, b, _ in js)
+        n_none = sum(b is None for _, b, _, _ in js)
         with ProcessPoolExecutor(96) as ex:
             for i, c in enumerate(ex.map(_crop, js, chunksize=16)):
                 arr[i, :8] = base[i]

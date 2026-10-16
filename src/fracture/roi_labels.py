@@ -43,6 +43,21 @@ OUTSIDE = False          # --outside: map locations outside every box to the nea
 FIBULA = False           # --fibula: the ninth crop (fracture.fibula) takes fibular-head / fibula fractures
 BONES = False            # --bones: + the 4 bone crops (fracture.bones): distal femur / proximal tibia, medial / lateral
 OC = 1.0                 # --oc: factor for osteochondral fractures
+EXTRA3 = False           # --extra3: + 3 crops (fracture.extra): whole patella, tibial tuberosity, fibular neck / shaft
+EXTRA_ROIS = ["Patella", "Tibial Tuberosity", "Fibula Shaft"]
+
+
+def extra_rois(loc):
+    """--extra3: the extra crop(s) of one reported location, with their factor."""
+    s, r, d = loc["structure"], loc["region"], loc.get("detail", "").lower()
+    out = []
+    if s in ("patella", "trochlea") or "patell" in d:
+        out.append(("Patella", 1.0))
+    if (s == "proximal tibia (other)" and r in ("anterior", "central", "unk")) or any(k in d for k in ("tuberosit", "tubercle", "anterior tibia", "patellar tendon")):
+        out.append(("Tibial Tuberosity", 1.0))
+    if "fibula" in d or "fibular" in d or s == "fibular head":
+        out.append(("Fibula Shaft", 0.5 if s == "fibular head" and not any(k in d for k in ("neck", "shaft")) else 1.0))
+    return out
 BONE_ROIS = ["Medial Femur", "Lateral Femur", "Medial Tibia", "Lateral Tibia"]
 
 
@@ -96,11 +111,12 @@ def main():
 
     global ACUITY
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    global OUTSIDE, FIBULA, BONES
+    global OUTSIDE, FIBULA, BONES, EXTRA3
     ap.add_argument("--version", default="v2", choices=list(ACUITY_VERSIONS))
     ap.add_argument("--neg_zero", action="store_true", help="studies outside the extraction (Claude < 0.3): 0, not the Claude label")
     ap.add_argument("--outside", action="store_true", help="map locations outside every box to the nearest crop(s) (OUTSIDE)")
     ap.add_argument("--fibula", action="store_true", help="add the fibular-head ROI (FIBULA): 9 per-ROI targets")
+    ap.add_argument("--extra3", action="store_true", help="add the 3 extra crops (EXTRA3, fracture.extra): 16 per-ROI targets")
     ap.add_argument("--bones", action="store_true", help="add the 4 bone ROIs (BONES, fracture.bones): 13 per-ROI targets")
     ap.add_argument("--oc", type=float, default=1.0,
                     help="factor for locations whose detail says 'osteochondral' (3 / 4 radiologist negatives on the 58)")
@@ -111,13 +127,13 @@ def main():
     a = ap.parse_args()
     ACUITY = ACUITY_VERSIONS[a.version]
     global OC
-    OUTSIDE, FIBULA, BONES, OC = a.outside, a.fibula, a.bones, a.oc
+    OUTSIDE, FIBULA, BONES, OC, EXTRA3 = a.outside, a.fibula, a.bones, a.oc, a.extra3
     suffix = ("" if a.version == "v1" else f"_{a.version}") + ("_z" if a.neg_zero else "") + ("_o" if a.outside else "") \
-        + ("_fib" if a.fibula else "") + ("_bones" if a.bones else "") + (f"_tr{int(a.trauma * 100)}" if a.trauma else "") \
+        + ("_fib" if a.fibula else "") + ("_bones" if a.bones else "") + ("_x3" if a.extra3 else "") + (f"_tr{int(a.trauma * 100)}" if a.trauma else "") \
         + (f"_oc{int(a.oc * 100)}" if a.oc != 1.0 else "")
     rows = json.load(open(os.path.join(LOC, "fracture_locations.json")))["studies"]
     claude = pd.read_csv(CLAUDE_LABELS_CSV).set_index("StudyInstanceUID")["Fracture"]
-    roi_classes = ROI_CLASSES + (["Fibula"] if FIBULA else []) + (BONE_ROIS if BONES else [])
+    roi_classes = ROI_CLASSES + (["Fibula"] if FIBULA else []) + (BONE_ROIS if BONES else []) + (EXTRA_ROIS if EXTRA3 else [])
     cols = [f"{c}|fracture" for c in roi_classes]
     base = claude * 0.0 if a.neg_zero else claude
     out = pd.DataFrame(np.repeat(base.values[:, None], len(cols), 1), index=claude.index, columns=cols)
@@ -142,6 +158,10 @@ def main():
                 for c in rs:
                     t[c] = max(t[c], v)
                     hit = True
+                if EXTRA3 and loc["structure"] != "unknown":
+                    for c, fx in extra_rois(loc):
+                        t[c] = max(t[c], CERTAINTY[loc["certainty"]] * ACUITY.get(r["acuity"] or "unk", 0.75) * fx * oc)
+                        hit = True
                 if BONES and loc["structure"] != "unknown":
                     for c, fb in bone_rois(loc):
                         t[c] = max(t[c], CERTAINTY[loc["certainty"]] * ACUITY.get(r["acuity"] or "unk", 0.75) * fb * oc)

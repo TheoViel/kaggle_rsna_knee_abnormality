@@ -49,7 +49,15 @@ READ_PROCS = int(os.environ.get("KNEE_READ_PROCS", 2))     # reader processes pe
 
 
 def list_series(data_dir, series_dir, series_csv, rule="fs"):
-    """One sagittal + one coronal series per study (all series of a study without the csv's plane column)."""
+    """Candidate series per study and slot (Sagittal / Coronal), ranked; read_study keeps the first usable one per
+    slot, so each study normally reads exactly one sagittal + one coronal series.
+
+    Per slot, in order: the series the csv labels with that plane (fluid-sensitive first, then SeriesInstanceUID);
+    the series without a plane label; then the study's other series (e.g. axial-labelled), as a last resort: the
+    DICOM geometry decides (a candidate whose orientation is not the slot's plane is skipped). rule="all": every
+    series, as labelled (no slots).
+    -> rows (StudyInstanceUID, SeriesInstanceUID, Anatomical_Plane, folder, slot, rank); rank 0 = first choice.
+    """
     df = pd.read_csv(series_csv) if series_csv and os.path.exists(series_csv) else None
     if df is None:
         rows = [(os.path.basename(os.path.dirname(p)), os.path.basename(p))
@@ -57,18 +65,22 @@ def list_series(data_dir, series_dir, series_csv, rule="fs"):
         df = pd.DataFrame(rows, columns=["StudyInstanceUID", "SeriesInstanceUID"])
     if "Anatomical_Plane" not in df:
         df["Anatomical_Plane"] = ""
-    if rule != "all" and df.Anatomical_Plane.isin(ROI_PLANES).any():
-        fs = df.Fluid_Sensitive if "Fluid_Sensitive" in df else 0
-        df = df.assign(k=-fs if rule == "fs" else 0)
-        known = df[df.Anatomical_Plane.isin(ROI_PLANES)]
-        pick = known.sort_values(["StudyInstanceUID", "Anatomical_Plane", "k", "SeriesInstanceUID"]) \
-            .groupby(["StudyInstanceUID", "Anatomical_Plane"]).head(1)
-        # Studies without a sagittal or coronal series (none in train): keep everything of them.
-        rest = df[~df.StudyInstanceUID.isin(known.StudyInstanceUID)]
-        df = pd.concat([pick, rest]).sort_values(["StudyInstanceUID", "SeriesInstanceUID"])
+    df["Anatomical_Plane"] = df.Anatomical_Plane.fillna("").astype(str)
     df["folder"] = [os.path.join(data_dir, series_dir, r.StudyInstanceUID, r.SeriesInstanceUID)
                     for r in df.itertuples()]
-    return df[["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder"]].reset_index(drop=True)
+    cols = ["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder", "slot", "rank"]
+    if rule == "all":
+        return df.assign(slot="all", rank=0)[cols].reset_index(drop=True)
+    fs = pd.to_numeric(df.Fluid_Sensitive, errors="coerce").fillna(0) if "Fluid_Sensitive" in df else 0
+    df = df.assign(fs=-fs if rule == "fs" else 0)
+    out = []
+    for slot in ROI_PLANES:
+        tier = np.where(df.Anatomical_Plane == slot, 0, np.where(~df.Anatomical_Plane.isin(ROI_PLANES + ("Axial",)), 1,
+                        np.where(df.Anatomical_Plane == "Axial", 3, 2)))
+        d = df.assign(slot=slot, tier=tier).sort_values(["StudyInstanceUID", "tier", "fs", "SeriesInstanceUID"])
+        d["rank"] = d.groupby("StudyInstanceUID").cumcount()
+        out.append(d)
+    return pd.concat(out).sort_values(["StudyInstanceUID", "slot", "rank"])[cols].reset_index(drop=True)
 
 
 # ------------------------------------------------------------------ reading (CPU threads)
@@ -144,7 +156,7 @@ def read_series(folder, plane, pool=None):
         vol = np.stack([d["pixels"] for d in px])
     else:
         vol = np.stack([dss[i]["pixels"] for i in kept])
-    plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
+    plane = plane if isinstance(plane, str) and plane and plane != "?" else (major or "Sagittal")
     geom = geometry_from_slices([d["ImageOrientationPatient"] for d in dss], [d["ImagePositionPatient"] for d in dss],
                                 dss[0]["PixelSpacing"], dss[0].get("SliceThickness"))
     dm = np.array(geom["direction"]).reshape(3, 3)
@@ -152,53 +164,77 @@ def read_series(folder, plane, pool=None):
     tag = next((d["Laterality"].upper()[:1] for d in dss if d.get("Laterality")), "")
     unsigned = vol.dtype == np.uint16
     raw = torch.from_numpy(vol.view(np.int16) if vol.dtype in (np.uint16, np.int16) else vol.astype(np.int32))
-    meta = dict(plane=plane, n_slices=n, n_cache=min(n, CACHE_MAX_SLICES), rows=int(vol.shape[1]),
+    meta = dict(plane=plane, geom_plane=major, n_slices=n, n_cache=min(n, CACHE_MAX_SLICES), rows=int(vol.shape[1]),
                 cols=int(vol.shape[2]), conv_flip=conv_flip, dicom_laterality=tag)
     return raw, unsigned, meta, geom
 
 
-def _read_job(r, pool):
+def _read_job(r, pool, plane=None):
     base = dict(StudyInstanceUID=r.StudyInstanceUID, SeriesInstanceUID=r.SeriesInstanceUID)
     try:
-        raw, unsigned, meta, geom = read_series(r.folder, r.Anatomical_Plane, pool)
+        raw, unsigned, meta, geom = read_series(r.folder, plane or r.Anatomical_Plane, pool)
         return dict(**base, **meta, status="ok", raw=raw, unsigned=unsigned, geom=geom)
     except Exception as e:  # noqa: BLE001 -- one bad series must not stop the run
         return dict(**base, plane=r.Anatomical_Plane, status=f"failed: {e!r}"[:300])
 
 
-class StudyReader:
-    """Studies in order (list of series dicts), read ahead by thread pools; reading starts at construction, so it
-    overlaps the model loading.
+MIN_SLICES = 5                             # fewer (localizer, broken series): try the slot's next candidate
 
-    Series jobs run on `series_pool`; each reads its files on `file_pool` (file reads are the slow, GIL-free part:
-    many in flight keep the network filesystem busy)."""
+
+def read_study(rows, pool):
+    """One study's candidate rows (list_series) -> list of series dicts: per slot, the first candidate that reads,
+    has >= MIN_SLICES slices and whose geometry is the slot's plane (unknown geometry: the slot's plane is assumed).
+    A series read for one slot and rejected there can fill the other slot. Slots left empty are skipped (worst case:
+    one series in one view; nothing usable: the study's findings fall back to 0.5). Failed reads are reported."""
+    if rows and rows[0].slot == "all":
+        return [_read_job(r, pool) for r in rows]
+    cache, used, out, failed = {}, set(), [], []
+    for slot in ROI_PLANES:
+        for r in (r for r in rows if r.slot == slot):
+            if r.SeriesInstanceUID in used:
+                continue
+            s = cache.get(r.SeriesInstanceUID)
+            if s is None:
+                s = cache[r.SeriesInstanceUID] = _read_job(r, pool, plane="?")
+            ok = s["status"] == "ok" and s["n_slices"] >= MIN_SLICES and s.get("geom_plane") in (slot, None)
+            if ok:
+                dm = np.array(s["geom"]["direction"]).reshape(3, 3)       # training left-right convention of the slot
+                s = dict(s, plane=slot, conv_flip=bool(dm[0, 2] > 0) if slot == "Sagittal" else bool(dm[0, 0] < 0))
+                if s["plane"] != r.Anatomical_Plane or r.rank:
+                    s["fallback"] = f"{slot} rank {r.rank} ({r.Anatomical_Plane or 'unlabelled'})"
+                if s["SeriesInstanceUID"] not in used:
+                    used.add(s["SeriesInstanceUID"])
+                    out.append(s)
+                break
+    for uid, s in cache.items():
+        if uid not in used and s["status"] != "ok":
+            failed.append(s)
+    return out + failed
+
+
+class StudyReader:
+    """Studies in order (list of series dicts), read ahead by a thread pool (one job per study, its files on
+    `file_pool`); reading starts at construction, so it overlaps the model loading."""
 
     def __init__(self, df, threads=THREADS, prefetch=PREFETCH):
-        self.rows, self.prefetch = list(df.itertuples()), prefetch
+        self.studies = [list(g.itertuples()) for _, g in df.groupby("StudyInstanceUID", sort=False)]
+        self.prefetch = max(1, prefetch // 2)
         self.file_pool = ThreadPoolExecutor(threads)
-        self.series_pool = ThreadPoolExecutor(max(2, threads // 4))
+        self.study_pool = ThreadPoolExecutor(max(2, threads // 4))
         self.futs, self.nxt = {}, 0
         self._fill()
 
     def _fill(self):
-        while self.nxt < len(self.rows) and len(self.futs) < self.prefetch:
-            self.futs[self.nxt] = self.series_pool.submit(_read_job, self.rows[self.nxt], self.file_pool)
+        while self.nxt < len(self.studies) and len(self.futs) < self.prefetch:
+            self.futs[self.nxt] = self.study_pool.submit(read_study, self.studies[self.nxt], self.file_pool)
             self.nxt += 1
 
     def __iter__(self):
-        study, cur = [], None
-        for i in range(len(self.rows)):
+        for i in range(len(self.studies)):
             self._fill()
-            s = self.futs.pop(i).result()
-            if cur is not None and s["StudyInstanceUID"] != cur:
-                yield study
-                study = []
-            cur = s["StudyInstanceUID"]
-            study.append(s)
-        if study:
-            yield study
+            yield self.futs.pop(i).result()
         self.file_pool.shutdown()
-        self.series_pool.shutdown()
+        self.study_pool.shutdown()
 
 
 class _StudyDataset(torch.utils.data.Dataset):
@@ -215,7 +251,7 @@ class _StudyDataset(torch.utils.data.Dataset):
         torch.set_num_threads(1)
         if self.pool is None:
             self.pool = ThreadPoolExecutor(self.threads)
-        return [_read_job(r, self.pool) for r in self.studies[i]]
+        return read_study(self.studies[i], self.pool)
 
 
 def process_reader(df, threads=THREADS, workers=2):
@@ -495,7 +531,7 @@ def process_post(studies, ser, models, timer):
                                                                         ["z0", "z1", "y0", "y1", "x0", "x1"]}
     crop_rows = [s for s in ser if s["SeriesInstanceUID"] in by_series]
     crops = {}
-    for z in {m["z"] for m in models.crops}:
+    for z in {m["z"] for m in models.crops} if crop_rows else ():          # no usable series: nothing to cut
         kw = json.loads(z)
         cap, cap_up = kw.pop("capsule", None), kw.pop("capsule_up", None)
         compartment, midline = kw.pop("compartment", None), kw.pop("oa_midline", "")
@@ -689,7 +725,7 @@ def run(data_dir, weights, out_dir, submission, gpus, threads, series_dir="test_
     os.makedirs(out_dir, exist_ok=True)
     for d in glob.glob(os.path.join(out_dir, "shard*")):
         shutil.rmtree(d)
-    df["shard"] = df.StudyInstanceUID.map(shard_studies(df, len(gpus)))
+    df["shard"] = df.StudyInstanceUID.map(shard_studies(df[df["rank"] == 0], len(gpus)))   # first choices
     df.to_csv(os.path.join(out_dir, "series_list.csv"), index=False)
     shards = sorted(df["shard"].unique())
     procs = []

@@ -73,7 +73,9 @@ def list_series(data_dir, series_dir, series_csv):
         df["Anatomical_Plane"] = ""
     df["folder"] = [os.path.join(data_dir, series_dir, r.StudyInstanceUID, r.SeriesInstanceUID)
                     for r in df.itertuples()]
-    return df[["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder"]]
+    if "Fluid_Sensitive" not in df:        # "name@FS" recipe entries: no flag -> every study falls back to all series
+        df["Fluid_Sensitive"] = np.nan
+    return df[["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder", "Fluid_Sensitive"]]
 
 
 def shard_studies(df, n):
@@ -144,7 +146,8 @@ class StudyDataset(Dataset):
         study, g = self.studies[i]
         out = []
         for r in g.itertuples():
-            base = dict(StudyInstanceUID=study, SeriesInstanceUID=r.SeriesInstanceUID)
+            base = dict(StudyInstanceUID=study, SeriesInstanceUID=r.SeriesInstanceUID,
+                        fluid=getattr(r, "Fluid_Sensitive", np.nan))
             try:
                 raw, unsigned, meta, geom = read_series(r.folder, r.Anatomical_Plane)
                 out.append(dict(**base, **meta, status="ok", raw=raw, unsigned=unsigned, geom=geom))
@@ -347,9 +350,26 @@ class Models:
         self.crops, self.hybrids = [], []
         # Entries may be nested lists (seed groups, combine()); "<name>" under <weights>/mt3d/ is a hybrid model.
         refs = {m for r in recipe.values() for m in flat(r["models"])}
-        # "name@Plane1,Plane2" entries: (entry, model, planes), averaged in process_chunk
+        # "name@Plane1,Plane2" entries: (entry, model, planes), averaged in process_chunk.
+        # "name@FS": the model's mean over the study's fluid-sensitive series (Fluid_Sensitive == 1 in the series csv),
+        # all its series when the study has none (bone-marrow edema shows on fluid-sensitive series only).
         self.restricted = [(x, x.split("@")[0], x.split("@")[1].split(",")) for x in sorted(refs) if "@" in x]
+        self.fs_refs = {}
+        for x, base, planes in self.restricted:
+            if planes == ["FS"]:
+                self.fs_refs.setdefault(base, []).append(x)
+        # "shared8": the teammate's four-model ROI ensemble in <weights>/shared8/ (infer.shared8), not a crop model.
+        self.shared8 = os.path.join(weights, "shared8") if "shared8" in {x.split("@")[0] for x in refs} else None
+        self.shared8_holder, self.shared8_out_dir = {}, None
+        # "<name>" under <weights>/study/: a study-level model of src_study (infer.study_models), one row per study.
+        study_names = {x.split("@")[0] for x in refs if os.path.isdir(os.path.join(weights, "study", x.split("@")[0]))}
+        self.studies, self.study_encoders = [], {}
+        if study_names:
+            from infer import study_models
+            self.studies, self.study_encoders = study_models.load(weights, study_names, device)
         for m in sorted({x.split("@")[0] for x in refs}):
+            if m == "shared8" or m in study_names:
+                continue
             if os.path.isdir(os.path.join(weights, "mt3d", m)):
                 self.hybrids.append(load_hybrid(os.path.join(weights, "mt3d", m), m, device))
                 continue
@@ -476,7 +496,8 @@ def process_chunk(studies, models, timer):
                                                                         ["z0", "z1", "y0", "y1", "x0", "x1"]}
     crop_rows = [s for s in ser if s["SeriesInstanceUID"] in by_series]
     crops = {}                            # sampling -> (crops (N, K, D, S, S), have (N, K))
-    for z in {m["z"] for m in models.crops}:
+    study_z = {m["z"] for m in models.studies} | {e["z"] for e in models.study_encoders.values()}
+    for z in {m["z"] for m in models.crops} | study_z:
         kw = json.loads(z)
         cap, cap_up = kw.pop("capsule", None), kw.pop("capsule_up", None)
         compartment, midline = kw.pop("compartment", None), kw.pop("oa_midline", "")
@@ -557,6 +578,9 @@ def process_chunk(studies, models, timer):
                         for (_, _, _, pl_, st, c), v in zip(part, p2[:len(part)].tolist())]
             out += [(m["name"], st, c, m["planes_all"][pl_], float(v))
                     for (_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist())]
+            for ref in models.fs_refs.get(m["name"], []):      # "name@FS": the fluid-sensitive series' rows again
+                out += [(ref, st, c, m["planes_all"][pl_], float(v))
+                        for (j_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist()) if crop_rows[j_].get("fluid") == 1]
         dt = time.time() - t
         timer["models"] += dt
         timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
@@ -573,6 +597,14 @@ def process_chunk(studies, models, timer):
             dt = time.time() - t
             timer["models"] += dt
             timer["model " + h["name"]] = timer.get("model " + h["name"], 0.0) + dt
+    # Study-level models (infer.study_models): every series' capsule crop of the study at once.
+    if models.studies and crop_rows:
+        from infer import study_models
+        t = time.time()
+        out += study_models.predict_chunk(models.studies, models.study_encoders, crop_rows, crops, AMP_DTYPE)
+        dt = time.time() - t
+        timer["models"] += dt
+        timer["study models"] = timer.get("study models", 0.0) + dt
     rows = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "plane", "p"])
     preds = rows.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
     # Per-ROI sub-targets / auxiliary outputs ("<ROI>|fracture") -> the study finding ("Fracture"): max over ROIs.
@@ -582,6 +614,11 @@ def process_chunk(studies, models, timer):
         sub = sub.assign(cls=sub.cls.str.split("|").str[1].map(finding_of)).dropna(subset=["cls"])
         preds = pd.concat([preds, sub.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.max()], ignore_index=True)
     for ref, base, planes in models.restricted:            # "name@planes" recipe entries
+        if planes == ["FS"]:                               # rows already added; studies without one: all series
+            have = set(preds.StudyInstanceUID[preds.model == ref])
+            fb = preds[(preds.model == base) & ~preds.StudyInstanceUID.isin(have)]
+            preds = pd.concat([preds, fb.assign(model=ref)], ignore_index=True)
+            continue
         sub = rows[(rows.model == base) & rows.plane.isin(planes)]
         preds = pd.concat([preds, sub.groupby(["StudyInstanceUID", "cls"], as_index=False).p.mean().assign(model=ref)],
                           ignore_index=True)
@@ -589,6 +626,12 @@ def process_chunk(studies, models, timer):
                            dicom_laterality=[s["dicom_laterality"] for s in ser])
     failed = pd.DataFrame([{k: s.get(k) for k in ["StudyInstanceUID", "SeriesInstanceUID", "plane", "status"]}
                            for st in studies for s in st if s["status"] != "ok"])
+    if models.shared8:                     # the shared8 ensemble on this chunk's sagittal / coronal series (infer.shared8)
+        from infer import shared8
+        t = time.time()
+        preds = pd.concat([preds, shared8.predict_chunk(studies, boxes, models.shared8, models.shared8_holder,
+                                                        models.shared8_out_dir)], ignore_index=True)
+        timer["shared8"] = timer.get("shared8", 0.0) + time.time() - t
     return pd.concat([series, failed], ignore_index=True), boxes, preds
 
 
@@ -600,6 +643,7 @@ def run_shard(df, weights, recipe, out_dir, workers):
     dev = torch.device("cuda")
     t0 = time.time()
     models = Models(weights, recipe, dev)
+    models.shared8_out_dir = out_dir
     timer = dict.fromkeys(["load", "warmup", "wait", "prep", "side", "unet", "boxes", "consensus", "crops", "models"], 0.0)
     timer["load"] = time.time() - t0
     t = time.time()
@@ -623,6 +667,8 @@ def run_shard(df, weights, recipe, out_dir, workers):
         for s in study:
             if s["status"] == "ok":
                 try:
+                    if models.shared8 and s["plane"] in ("Sagittal", "Coronal"):     # its own renderer reads raw pixels
+                        s["_shared8_raw"], s["_shared8_unsigned"] = s["raw"], s["unsigned"]
                     s["cache"] = gpu_cache(s.pop("raw").to(dev, non_blocking=True), s.pop("unsigned"))
                     v = gpu_volume(s["cache"])
                     s["volume"] = v.flip(_lr_axis(s["plane"])) if s["conv_flip"] else v
@@ -638,6 +684,8 @@ def run_shard(df, weights, recipe, out_dir, workers):
         t = time.time()
     if chunk:
         flush()
+    if models.shared8_holder.get("worker") is not None:
+        models.shared8_holder["worker"].close()
     os.makedirs(out_dir, exist_ok=True)
     pd.concat(all_series, ignore_index=True).to_csv(os.path.join(out_dir, "series.csv"), index=False)
     pd.concat(all_boxes, ignore_index=True).to_csv(os.path.join(out_dir, "rois.csv"), index=False)

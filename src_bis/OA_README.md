@@ -204,3 +204,81 @@ The current menisci recipe scores 0.983 / 0.955 (medial) and 0.959 / 0.921 (late
 - **Single-finding training gives ±0.01 on the 128 px models, and nothing on the strong CoAtNet setup.**
 
 The only menisci gain found so far remains the OAI-only `all` model as an extra medial meniscus vote: 0.990 / 0.959 against 0.983 / 0.955 (see `oai-menisci` in memory and the earlier OAI report).
+
+## PF OA and the OAI-only vote (2026-10-14 afternoon): recipe R2
+
+R's PF OA was the single `mk90` model (MOAKS-pretrained, init 2026-10-11/8), the luckiest of its 3 seeds on the 58. Scripts: `oa_oai_vote.py` (offline), `prepare_pf_mid.py` (PF crop limits).
+
+- **PF cross-talk, from the labels.** Spearman PF ~ medial / lateral OA is 0.37 / 0.28 for the radiologists, but 0.69 / 0.69 for the report labels we train on, and 0.74–0.77 for every PF model. The models learn "PF ≈ any OA".
+- **PF-limited sagittal crops do not fix it** (unlike the lateral OA midline):
+  - Moving the window (stop at the menisci's anterior edge, or at the joint line) loses PF anatomy: half the window is air, or the patella is cut.
+  - Zeroing the tibiofemoral corner of mk90's window (`f_s1n8_pfmask`, S15, PF-only, Claude labels, run 2026-10-14/228): 0.914 / 0.936, the same as S10 seed 0 (0.914 / 0.937). Cross-talk unchanged (0.74). Discarded after the first seed.
+- **The minus correction does fix it.** PF − β × combined medial OA, with a plateau at β 0.2–0.4 for every PF base, on both sets. At β = 0.3:
+
+  | PF base | no correction | − 0.3 × medial |
+  |---|---|---|
+  | mk90 seed 17 | 0.923 / 0.930 | 0.936 / 0.939 |
+  | [mk90 ×3] | 0.907 / 0.932 | 0.921 / 0.941 |
+  | [S10] | 0.915 / 0.937 | 0.918 / 0.943 |
+  | [mk90 ×3] + [S10] | 0.910 / 0.936 | 0.923 / 0.944 |
+
+- **R2's PF:** [mk90 ×3] + [S10] − 0.3 × medial OA. Two seed groups, all MOAKS-pretrained, no lucky seed.
+  - Pipeline with validation twins (`weights_val_oa/recipe_R2.json`): **0.921 / 0.945** vs R 0.921 / 0.931. Bootstrap (offline): 58 −0.001 (P 0.47), holdout +0.014 (P 0.99).
+  - Fullfits: mk90 seeds 1 and 2 = 2026-10-14/229, /232 (`mk90s1`, `mk90s2`); S10 = pfc0–2.
+  - Package: `output/bis/dataset_oa/recipe_R2.json`. Fullfit vs twins Spearman on PF: 0.949.
+- **OAI-only models (2026-10-13/35, /42) as an OA vote: worse everywhere.** Alone: medial 0.930, lateral 0.803, PF 0.812. As one extra vote: medial −0.006, lateral −0.045 / −0.023, PF −0.037 / −0.015.
+- **OAI-only as the medial meniscus vote: confirmed** (pipeline, validation twins): 0.983 / 0.955 → **0.990 / 0.959** (bootstrap P 0.91 / 0.97). Copied to `dataset_oa/crops/oai0`, `oai1`. To use it, see the package readme.
+- **Fullfit of the OAI vote: OAI + the 58 radiologist studies** (`src_bis/train_oai58.py`; runs 2026-10-14/235, /237 = seeds 0, 1; package `oai58s0`, `oai58s1`).
+  - `--extra_only --fullfit` alone would drop the 58; the wrapper appends their 255 series (2.6% of the items, radiologist labels).
+  - Holdout (the only clean set): alone 0.948 and as the medial meniscus vote 0.958, against 0.948 / 0.959 for OAI-only.
+  - Spearman with OAI-only on the 493 validation studies: 0.949.
+  - `--gt_repeat k` weights the 58 up; not tried, as it can't be validated.
+
+## Decorrelated OA pseudo-labels (2026-10-14 evening): no gain
+
+**Idea:** pseudo-labels from teachers without the cross-talk, so students get pseudo-labels' smoothing without `pl_round2`'s amplified medial–lateral correlation.
+
+**Teachers:** out of fold. `src_bis/train_oof.py` uses 5 folds over the training studies only; the 58 and the holdout are predicted by every fold and trained by none. `main_crops`' own k-fold mode would train on them. Seed 0, runs in `logs/oa_runs.txt` ("OOF"):
+- T1: lateral-only on `oa_cmp30_mid`, Claude labels (S9's setup);
+- T2: PF-only, Claude labels (S10's setup);
+- T3: the mk90 setup.
+
+**Pseudo-labels** (`src_bis/make_pl_dec.py` → `output/crops/pl_oadec.csv`, recipe fixed in advance):
+- Teacher scores, as ranks:
+  - lateral = T1 − 0.3 × T3's medial OA;
+  - PF = mean(T2, T3) − 0.3 × T3's medial OA.
+- Each corrected rank is mapped onto the teachers' own probabilities (quantile mapping).
+- Target = 0.5 × teacher + 0.5 × Claude label. Only the lateral and PF OA columns of `pl_round2` are replaced, and only on the training studies.
+
+**The labels are decorrelated.** Spearman over the 3,914 training studies:
+
+| Labels | medial–lateral | medial–PF |
+|---|---|---|
+| Claude | 0.76 | 0.65 |
+| `pl_round2` | 0.80 | 0.70 |
+| `pl_oadec` | 0.67 | 0.61 |
+
+The teachers on the 58 / holdout: corrected lateral 0.932 / 0.931, corrected PF 0.916 / 0.947.
+
+**The students don't gain.** Baselines are each setup's 3-seed group or mean:
+
+| Student | pl_oadec | Baseline |
+|---|---|---|
+| S16 lateral-only cmp30 (291, 296, 301) | group 0.913 / 0.928 | S9 0.919 / 0.928 |
+| S17 PF-only (292) | 0.901 / 0.939 | S10 seed mean 0.916 / 0.936 (discarded after seed 0) |
+| S18 mk90 setup (293, 297, 303), medial | 0.981 / 0.947 | seed mean 0.975 / 0.947 |
+| S18 mk90 setup, lateral | 0.867 / 0.931 | seed mean 0.872 / 0.912 |
+| S18 mk90 setup, PF | 0.906 / 0.939 | [mk90 ×3] 0.907 / 0.932 |
+
+The students' prediction cross-talk drops only a little (0.78 → 0.76 lateral, 0.77 → 0.72 for the mk90 setup).
+
+**Inside R2** (`src_bis/pl_dec_r2.py`, offline, against R2 at 0.988 / 0.950, 0.938 / 0.934, 0.923 / 0.944):
+- Lateral [S16] instead of [S9]: −0.016 / −0.009. [S9] + [S16]: −0.005 / −0.004.
+- PF [S18] instead of [mk90 ×3]: −0.005 / −0.001.
+- An extra medial vote [S18]: −0.002 / 0.000.
+- mk90 → [S18] inside the first medial vote: ±0.000.
+- All together: −0.002 to −0.005.
+
+**Why:** R2 already removes the cross-talk at the recipe level, with the minus correction on lateral and PF. Students that learn the corrected ordering bring nothing the correction doesn't. Their holdout gains (S18 lateral +0.019) are the report-label convention: pl_oadec is half Claude, which are the holdout's labels.
+
+**R2 is unchanged.**
