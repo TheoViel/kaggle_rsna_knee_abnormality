@@ -101,7 +101,7 @@ def read_series(folder, plane):
     """
     import pydicom
 
-    from infer.prep import slice_order
+    from infer.prep import slice_order, to_monochrome2
     from knee_registration import geometry_from_slices
 
     files = sorted(glob.glob(os.path.join(folder, "*.dcm")))
@@ -119,6 +119,7 @@ def read_series(folder, plane):
     kept = np.round(np.linspace(0, n - 1, CACHE_MAX_SLICES)).astype(int) if n > CACHE_MAX_SLICES else range(n)
     arrs = [(dss[i] if full else pydicom.dcmread(files[i])).pixel_array for i in kept]
     vol = np.stack([a[0] if a.ndim == 3 and a.shape[0] == 1 else a for a in arrs])
+    vol = to_monochrome2(vol, [dss[i] for i in kept])        # MONOCHROME1 slices inverted
     plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
     geom = geometry_from_slices([d.ImageOrientationPatient for d in dss], [d.ImagePositionPatient for d in dss],
                                 dss[0].PixelSpacing, dss[0].get("SliceThickness"))

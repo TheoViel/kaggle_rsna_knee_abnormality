@@ -61,6 +61,20 @@ def slice_order(dss):
         return np.argsort(inst, kind="stable"), None
 
 
+def to_monochrome2(vol, dss):
+    """Slices stored as MONOCHROME1 (minimum value = white) inverted to the MONOCHROME2 convention every model was
+    trained on: v -> min + max - v over the volume, in its dtype. All training / validation series are MONOCHROME2;
+    this guards the hidden test set. The per-series percentile normalisation that follows makes the result the
+    mirror image of the stored intensities, as a viewer would display them."""
+    inv = np.array([str(d.get("PhotometricInterpretation", "")).strip().upper() == "MONOCHROME1" for d in dss])
+    if not inv.any():
+        return vol
+    lo, hi = int(vol.min()), int(vol.max())
+    out = vol.copy()
+    out[inv] = (lo + hi - vol[inv].astype(np.int64)).astype(vol.dtype)
+    return out
+
+
 def read_series(folder):
     import pydicom
 
@@ -75,7 +89,7 @@ def read_series(folder):
         keep = max(set(shapes), key=shapes.count)
         dss = [d for d, s in zip(dss, shapes) if s == keep]
         arrs = [a for a, s in zip(arrs, shapes) if s == keep]
-    vol = np.stack(arrs)
+    vol = to_monochrome2(np.stack(arrs), dss)
     tag = next((str(d.get("Laterality", "")).upper()[:1] for d in dss if d.get("Laterality", "")), "")
     return vol, dss, major, tag
 
