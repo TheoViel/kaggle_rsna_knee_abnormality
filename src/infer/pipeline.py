@@ -395,6 +395,8 @@ class Models:
                 net = net.to(memory_format=torch.channels_last)
             takes = {f for f, r in recipe.items() if any(x.split("@")[0] == m for x in flat(r["models"]))}   # findings from it
             takes |= self.emb_needs.get(m, set())                # crops read by embedding heads
+            if any(f.startswith("_") for f in takes):             # "_<name>" entries (e.g. "_oai"): run for the notebook's
+                takes |= set(group)                              # blends, every finding of the model, no recipe column
             aux = finding_of(a["aux"]) if a.get("aux") else None
             if aux in takes:          # auxiliary per-ROI output (e.g. fracture): needs every ROI crop of the model
                 used = list(group)
@@ -751,6 +753,8 @@ def combine(preds, recipe, studies):
         return tab[m][c].reindex(study.index) if m in tab and c in tab[m] else pd.Series(np.nan, index=study.index)
 
     for c, r in recipe.items():
+        if c.startswith("_"):                                  # "_<name>": models run for the notebook only
+            continue
         study[c] = rank_mean([member(m, c) for m in r["models"]])
     base = study.copy()
     for c, r in recipe.items():
