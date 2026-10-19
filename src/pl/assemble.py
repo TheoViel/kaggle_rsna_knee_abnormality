@@ -42,6 +42,8 @@ def kfold_runs():
         d = os.path.dirname(f)
         if not a.get("n_folds") or not os.path.exists(os.path.join(d, "ckpt_final.pt")):
             continue
+        if a.get("kfold_clean") is not True:   # runs before 2026-10-17 trained on the 58's radiologist labels: leaky
+            continue
         out.setdefault(key(a), []).append((d, a["fold"], a["seed"], a["n_folds"]))
     return out
 

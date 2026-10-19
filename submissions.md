@@ -2,29 +2,34 @@
 
 ## Leaderboard
 
-The public LB uses about 30% of the roughly 1,300 test studies (about 390). Scores are rounded to 0.001, and the list is ordered by the exact score, so the order inside a tie is real.
+Since 2026-10-18 the LB scores are known to 4 decimals. The public LB uses about 30% of the roughly 1,300 test studies (about 390). Scores are rounded to 0.001, and the list is ordered by the exact score, so the order inside a tie is real.
 
 **The 58 column** is the macro AUC over all 12 findings as submitted, on the 58 radiologist studies. It uses the validation (non-fullfit) counterparts of each package's models, combined as `infer.pipeline` does, then the notebook's merges: b1_c1 alone for findings without models, 50/50 rank blends for effusion, contusion and fracture, rank(models, rank(family, b1_c1)) for synovitis. `dataset_8` has no b1_c1. Computed by `src_study/tools/sub58.py` (per-finding scores in `logs/study_run/sub58.csv`).
 
+**Exact scores (2026-10-18):** `dataset_13` 0.9651, `dataset_20` 0.9658, `dataset_21` 0.9649. The "LB − 13 (implied)" column for older submissions was built assuming `dataset_13` ≈ 0.9646 and 0.0001 between tied neighbours. With 0.9651 that is inconsistent: `dataset_17`'s reported −0.0015 would give 0.9636, which rounds to 0.964 rather than 0.963. Treat the implied offsets as order-only.
+
 | # | LB | LB − 13 (implied) | Weights | What it is | 58 |
 |---|---|---|---|---|---|
-| 1 | **0.965** | 0 | `rsna-knee-weights-13` | `dataset_12` with lateral OA back to `mk89`, synovitis models at 224 px (`sy224a` / `b`) | 0.9585 |
-| 2 | 0.964 | −0.0001 | weights-13 + 2× OA correction | Notebook `OA_CORRECTION` (assumed `{"Lateral OA": 0.3, "PF OA": 0.3}`) | 0.9593 |
-| 3 | 0.964 | −0.0002 | `rsna-knee-weights-6` | `2-moaks-mrnet-men` + synovitis models (`sy0`, `sy1`, `sc0`, `sc1`) | 0.9563 |
-| 4 | 0.964 | −0.0003 | `rsna-knee-weights-7` | `dataset_6` + contusion (`cc0`–`2`) and effusion (`ef0`–`1`) models | 0.9564 |
-| 5 | 0.963 | −0.0013 | `rsna-knee-weights-2-moaks-mrnet-men` | `2-moaks-mrnet` + MOAKS-pretrained menisci model `mk87`, CAFormer `cafax87` | 0.9531 |
-| 6 | 0.963 | −0.0014 | `rsna-knee-weights-2-moaks-mrnet-men-frac` | `2-moaks-mrnet-men` + fracture models `fr9a` / `fr9b` | 0.9542 |
-| 7 | 0.963 | −0.0015 | `rsna-knee-weights-17` | `dataset_13` + 50% rank blends with C1 RadImageNet heads (`c1rad`, `c1cm`) on medial / lateral / PF OA, Baker's, fracture, effusion | 0.9626 |
-| 8 | 0.963 | −0.0016 | `rsna-knee-weights-2-moaks-mrnet` | `2-moaks` + MRNet-trained ACL `mr85` and MCL `pl86` | 0.9515 |
-| 9 | 0.963 | −0.0017 | `rsna-knee-weights-2-moaks` | `dataset_2` with MOAKS-pretrained OA models (`mk89`, `mk90`) | 0.9504 |
-| 10 | 0.963 | −0.0018 | `rsna-knee-weights-12` | `dataset_11` + PF OA blend (`mk90`, `mk89`, `ax0`) | 0.9615 |
-| 11 | 0.963 | −0.0019 | `rsna-knee-weights-11` | `dataset_10` with lateral OA `lc0`–`2` (no correction); no contusion / effusion models | 0.9615 |
-| 12 | 0.962 | −0.0021 to −0.0029 | `rsna-knee-weights-2-moaks-hybrid` | `2-moaks` + 4 mt3d hybrid models on the 8 ROI findings (`output/bis/dataset_2_moaks_hybrid`) | 0.9448 |
-| 13 | 0.962 | −0.0022 to −0.0030 | `rsna-knee-weights-2` | Retrained ROI models (`85`–`91`) | 0.9480 |
-| 14 | 0.962 | −0.0023 to −0.0031 | `rsna-knee-weights-1` | First package (`63`–`69`) | 0.9420 |
-| 15 | 0.962 | −0.0024 to −0.0032 | `rsna-knee-weights-4` | `dataset_2` with midline OA models (`o37`–`o43`), lateral OA − 0.4 × medial OA | 0.9511 |
-| 16 | 0.962 | −0.0025 to −0.0033 | `rsna-knee-weights-5` | `dataset_4` + ACL `a65` / `a77`–`79`, 8-frame retrains | 0.9526 |
-| 17 | 0.959 | −0.0050 to −0.0063 | `rsna-knee-weights-8` | `dataset_7` + fracture models `fr9a` / `fr9b`; submitted **without b1_c1**: effusion, synovitis, contusion and fracture from our models alone | 0.9557 |
+| 1 | **0.9658** | **+0.0007** (exact) | `rsna-knee-weights-20` | `dataset_13` + 25% of an OAI-only ensemble (21 models trained only on OAI MOAKS gradings) on the 9 OAI-graded findings | 0.9577 |
+| 2 | 0.9649 | **−0.0002** (exact) | weights-20 + notebook -21 | `dataset_13` + 50% of the OAI-only ensemble on medial / lateral / PF OA only | 0.9548 |
+| 3 | **0.9651** (exact) | 0 | `rsna-knee-weights-13` | `dataset_12` with lateral OA back to `mk89`, synovitis models at 224 px (`sy224a` / `b`) | 0.9585 |
+| 4 | 0.964 | −0.0001 | weights-13 + 2× OA correction | Notebook `OA_CORRECTION` (assumed `{"Lateral OA": 0.3, "PF OA": 0.3}`) | 0.9593 |
+| 5 | 0.964 | −0.0002 | `rsna-knee-weights-6` | `2-moaks-mrnet-men` + synovitis models (`sy0`, `sy1`, `sc0`, `sc1`) | 0.9563 |
+| 6 | 0.964 | −0.0003 | `rsna-knee-weights-7` | `dataset_6` + contusion (`cc0`–`2`) and effusion (`ef0`–`1`) models | 0.9564 |
+| 7 | 0.9635 | **−0.0016** (exact; −0.0023 vs `dataset_20`) | weights-20 + notebook -22 | `dataset_20` with 50% OAI on effusion, synovitis and Baker's (25% on the 6 others) | 0.9558 |
+| 8 | 0.963 | −0.0013 | `rsna-knee-weights-2-moaks-mrnet-men` | `2-moaks-mrnet` + MOAKS-pretrained menisci model `mk87`, CAFormer `cafax87` | 0.9531 |
+| 9 | 0.963 | −0.0014 | `rsna-knee-weights-2-moaks-mrnet-men-frac` | `2-moaks-mrnet-men` + fracture models `fr9a` / `fr9b` | 0.9542 |
+| 10 | 0.963 | −0.0015 | `rsna-knee-weights-17` | `dataset_13` + 50% rank blends with C1 RadImageNet heads (`c1rad`, `c1cm`) on medial / lateral / PF OA, Baker's, fracture, effusion | 0.9626 |
+| 11 | 0.963 | −0.0016 | `rsna-knee-weights-2-moaks-mrnet` | `2-moaks` + MRNet-trained ACL `mr85` and MCL `pl86` | 0.9515 |
+| 12 | 0.963 | −0.0017 | `rsna-knee-weights-2-moaks` | `dataset_2` with MOAKS-pretrained OA models (`mk89`, `mk90`) | 0.9504 |
+| 13 | 0.963 | −0.0018 | `rsna-knee-weights-12` | `dataset_11` + PF OA blend (`mk90`, `mk89`, `ax0`) | 0.9615 |
+| 14 | 0.963 | −0.0019 | `rsna-knee-weights-11` | `dataset_10` with lateral OA `lc0`–`2` (no correction); no contusion / effusion models | 0.9615 |
+| 15 | 0.962 | −0.0021 to −0.0029 | `rsna-knee-weights-2-moaks-hybrid` | `2-moaks` + 4 mt3d hybrid models on the 8 ROI findings (`output/bis/dataset_2_moaks_hybrid`) | 0.9448 |
+| 16 | 0.962 | −0.0022 to −0.0030 | `rsna-knee-weights-2` | Retrained ROI models (`85`–`91`) | 0.9480 |
+| 17 | 0.962 | −0.0023 to −0.0031 | `rsna-knee-weights-1` | First package (`63`–`69`) | 0.9420 |
+| 18 | 0.962 | −0.0024 to −0.0032 | `rsna-knee-weights-4` | `dataset_2` with midline OA models (`o37`–`o43`), lateral OA − 0.4 × medial OA | 0.9511 |
+| 19 | 0.962 | −0.0025 to −0.0033 | `rsna-knee-weights-5` | `dataset_4` + ACL `a65` / `a77`–`79`, 8-frame retrains | 0.9526 |
+| 20 | 0.959 | −0.0050 to −0.0063 | `rsna-knee-weights-8` | `dataset_7` + fracture models `fr9a` / `fr9b`; submitted **without b1_c1**: effusion, synovitis, contusion and fracture from our models alone | 0.9557 |
 
 Not submitted: `dataset_18` (58: 0.9629), `dataset_19` (0.9658).
 
@@ -56,8 +61,14 @@ With `dataset_17` at −0.0015 from `dataset_13` (the measured drop), this fixes
 | 6 → 13 | Synovitis 224 px, bone-crop fracture `fb0` / `fb1`, PF OA blend | Fracture +0.022, Synovitis +0.004 | +0.0022 | +0.0002 |
 | 13 → 13 + OA correction | Lateral OA and PF OA − 0.3 × medial OA | LOA +0.006, PF OA +0.004 | +0.0008 | −0.0001 |
 | 13 → 17 | 6 blends with RadImageNet C1 heads | LOA +0.023, PF OA +0.011, MOA +0.006, Effusion +0.005, Fracture +0.003, Baker's +0.002 | +0.0042 | **−0.0015** |
+| 13 → 20 | + 25% OAI-only ensemble on 9 findings | Medial meniscus +0.007, synovitis +0.005, lateral OA +0.002; PF OA −0.012, ACL −0.007, lateral meniscus −0.005 | −0.0008 | **+0.0007** (exact) |
+| 13 → 21 | + 50% OAI-only ensemble on the 3 OA findings | Medial OA −0.011, lateral OA −0.010, PF OA −0.023 | −0.0037 | −0.0002 (exact) |
+| 20 → 22 | OAI share 25% → 50% on effusion, synovitis, Baker's | Synovitis −0.016, effusion −0.006, Baker's −0.001 | −0.0019 | **−0.0023** (exact) |
 
 ### What the comparisons show
+
+- **OAI is the direction that works (2026-10-18).** `dataset_20`, 25% of an ensemble trained only on OAI MOAKS gradings on 9 findings, gained +0.0007 on the LB (exact: 0.9658 vs 0.9651) while the 58 lost 0.0008. The holdout said +0.0012. `dataset_21`, 50% on the OA findings only, cut the lateral–medial OA correlation from 0.85 to 0.66 and came in at −0.0002 (holdout −0.0004, 58 −0.0037). So the OAI decoupling did not lose like the earlier ones. **For OAI blends the holdout predicted the LB direction both times, the 58 neither.**
+- **But not at 50% on the b1_c1 findings (`dataset_22`, −0.0023 vs `dataset_20`).** Raising OAI to 50% on effusion, synovitis and Baker's lost clearly. Here the 58 called it (−0.0019) and the holdout could not: it has no effusion / synovitis scores, since those columns come from b1_c1. Rule: the holdout guides the ROI findings, the 58 guides the b1_c1 findings. b1_c1 stays the strongest model on effusion / synovitis / contusion on the test set (see also 7 → 8).
 
 - **The 58 doesn't rank submissions.** `dataset_13` has the lowest 58 score among 11, 12, 13 and 17, and the best LB.
 - **Every change that moved lateral OA away from `mk89` lost on the LB,** despite gains on the 58 (and twice on the holdout):

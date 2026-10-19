@@ -32,6 +32,7 @@ StudyInstanceUID, cls, p), roi_study_preds.csv; and --submission.
 """
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -59,6 +60,22 @@ SIDE_BATCH, UNET_BATCH, CROP_BATCH = 64, 16, 64
 CAPSULE_BATCH = 16
 HYBRID_GROUPS = 4                        # hybrid models: study groups (of `slots` series) per forward
 AMP_DTYPE = torch.float16                # hybrid models' autocast (--amp): float16 (T4), bfloat16 (as validated), None = fp32
+# --half: crop models with float16 weights and float16 inputs, no autocast (as the efficiency pipeline,
+# efficiency/pipeline.py): half the weight memory. Off: float32 weights under float16 autocast. The side model and the
+# ROI U-Net always stay float32 under autocast: in float16 the U-Net moved 14 / 1828 boxes by > 2 voxels.
+HALF = False
+
+
+def _amp():
+    """Precision context of the crop models: none in --half mode (the weights are float16)."""
+    return contextlib.nullcontext() if HALF else torch.autocast("cuda", dtype=torch.float16)
+
+
+def _dt():
+    return torch.float16 if HALF else torch.float32
+
+
+AUTOCAST = dict(device_type="cuda", dtype=torch.float16)   # side model, U-Net
 CHUNK = 24                               # studies per GPU chunk
 
 
@@ -373,6 +390,7 @@ class Models:
         emb_names = {x.split("@")[0] for x in refs if os.path.isdir(os.path.join(weights, "embheads", x.split("@")[0]))}
         self.emb_heads, self.emb_needs = [], {}
         if emb_names:
+            assert not HALF, "--half: embedding heads read float32 crop-model features, not supported"
             from infer import emb_heads
             self.emb_heads, self.emb_needs = emb_heads.load(weights, emb_names, device)
         for m in sorted(({x.split("@")[0] for x in refs} - emb_names) | set(self.emb_needs)):
@@ -390,7 +408,7 @@ class Models:
             if n_planes != net.plane_embed.num_embeddings:     # runs from before axial crops: 2 planes
                 net.plane_embed = nn.Embedding(n_planes, net.plane_embed.embedding_dim)
             net.load_state_dict(sd)
-            net = net.to(device).eval()
+            net = net.to(device, _dt()).eval()
             if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
                 net = net.to(memory_format=torch.channels_last)
             takes = {f for f, r in recipe.items() if any(x.split("@")[0] == m for x in flat(r["models"]))}   # findings from it
@@ -412,18 +430,25 @@ class Models:
                                    rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
 
 
+    def _warm_crops(self):
+        z, dt = torch.zeros, _dt()
+        for m in self.crops:
+            i = z(m["batch"], dtype=torch.long, device=self.device)
+            k = json.loads(m["z"])
+            m["net"](z((m["batch"], k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device, dtype=dt),
+                     i, i)
+
     @torch.no_grad()
     def warmup(self):
         """One dummy batch through every network: CUDA / cuDNN first-call costs, out of the timings."""
-        amp = dict(device_type="cuda", dtype=torch.float16)
         z = torch.zeros
-        with torch.autocast(**amp):
+        with torch.autocast(**AUTOCAST):  # without --half the crop models stay in this same context (as before)
             self.side(z((SIDE_BATCH, 4, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
             self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
-            for m in self.crops:
-                i = z(m["batch"], dtype=torch.long, device=self.device)
-                k = json.loads(m["z"])
-                m["net"](z((m["batch"], k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device), i, i)
+            if not HALF:
+                self._warm_crops()
+        if HALF:
+            self._warm_crops()
         # Only with hybrids: an extra autocast context shifts the fp16 numerics of later models (CAFormer, ~1e-4).
         if self.hybrids:
             with torch.autocast("cuda", dtype=AMP_DTYPE or torch.float16, enabled=AMP_DTYPE is not None):
@@ -456,7 +481,7 @@ def process_chunk(studies, models, timer):
         part = ser[i:i + SIDE_BATCH]
         x = _padded(torch.stack([s["volume"] for s in part])[:, None], SIDE_BATCH)
         pl = _padded(torch.tensor([SIDE_PLANES.index(s["plane"]) for s in part], device=dev), SIDE_BATCH)
-        with torch.autocast(**amp):
+        with torch.autocast(**AUTOCAST):
             p_right.append(torch.sigmoid(models.side(model_input(x, pl)).float())[:len(part)].cpu())
     p_right = torch.cat(p_right).numpy() if ser else np.zeros(0)
     for s, p in zip(ser, p_right):
@@ -471,7 +496,7 @@ def process_chunk(studies, models, timer):
     for i in range(0, len(seg), UNET_BATCH):
         part = seg[i:i + UNET_BATCH]
         x = torch.stack([s["volume"].flip(_lr_axis(s["plane"])) if s["side"] == "L" else s["volume"] for s in part])
-        with torch.autocast(**amp):
+        with torch.autocast(**AUTOCAST):
             prob = torch.sigmoid(models.unet(_padded(x[:, None], UNET_BATCH).float() / 255).float())
         prob = torch.stack([prob[j].flip(_lr_axis(s["plane"]) + 1) if (s["side"] == "L") ^ s["conv_flip"]
                             else prob[j] for j, s in enumerate(part)]).cpu().numpy()
@@ -515,7 +540,12 @@ def process_chunk(studies, models, timer):
         union = [c for c in kw.pop("union", "").split(",") if c]
         fibula = kw.pop("fibula", False)
         bones = kw.pop("bones", False)
-        if fibula:                        # 9 ROIs: + the fibular head, derived from the series' boxes (fracture.fibula)
+        fullfov = kw.pop("fullfov", False)
+        if fullfov:                       # whole-volume crops (crops.prepare --boxes fullfov --capsule 0): every slice,
+            series_boxes = {s["SeriesInstanceUID"]: {"Capsule": dict(z0=0, z1=s["n_slices"] - 1, y0=0, y1=s["rows"] - 1,
+                                                                     x0=0, x1=s["cols"] - 1)} for s in crop_rows}
+            kw.update(classes=["Capsule"], margin=0.0)        # the full field of view, no margin
+        elif fibula:                        # 9 ROIs: + the fibular head, derived from the series' boxes (fracture.fibula)
             from fracture.fibula import fibula_box
             if bones:                     # 13 ROIs: + 4 bone boxes, distal femur / proximal tibia (fracture.bones)
                 from fracture.bones import BONES, bone_boxes
@@ -580,9 +610,9 @@ def process_chunk(studies, models, timer):
         for i in range(0, len(items), nb):
             part = items[i:i + nb]
             j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
-            x = _padded(x_all[j, roi], nb).float() / 255
+            x = (_padded(x_all[j, roi], nb).float() / 255).to(_dt())
             need = models.emb_needs.get(m["name"], set())
-            with torch.autocast(**amp):
+            with _amp():
                 if any(c in need for *_, c in part):          # the same pass, also returning the features
                     from infer import emb_heads
                     assert not m["aux"], "embedding heads on auxiliary-output crop models are not supported"
@@ -765,7 +795,7 @@ def combine(preds, recipe, studies):
 
 
 def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_series", series_csv=None,
-        limit=None, recipe_path=None, amp="fp16"):
+        limit=None, recipe_path=None, amp="fp16", half=False):
     t0 = time.time()
     recipe_path = recipe_path or os.path.join(weights, "recipe.json")
     recipe = load_recipe(recipe_path)
@@ -784,7 +814,7 @@ def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_
         procs.append(subprocess.Popen(
             [sys.executable, "-m", "infer.pipeline", "--shard", str(i),
              "--weights", weights, "--out_dir", out_dir, "--workers", str(workers), "--recipe", recipe_path,
-             "--amp", amp],
+             "--amp", amp] + (["--half"] if half else []),
             env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(g))))
     if any(p.wait() for p in procs):
         raise RuntimeError("a shard failed")
@@ -823,12 +853,15 @@ def main():
     p.add_argument("--series_csv", default=None, help="series list (default: walk <data_dir>/<series_dir>)")
     p.add_argument("--limit", type=int, default=None, help="first N studies (debugging)")
     p.add_argument("--recipe", default=None, help="recipe file (default: <weights>/recipe.json)")
+    p.add_argument("--half", action="store_true", help="crop models in float16 (weights and inputs), no autocast: "
+                   "half their weight memory (efficiency pipeline); the side model and U-Net stay float32 + autocast")
     p.add_argument("--amp", default="fp16", choices=["fp16", "bf16", "fp32"],
                    help="hybrid models' autocast (fp16: T4; bf16: as validated); crop models are unaffected")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     a = p.parse_args()
-    global AMP_DTYPE
+    global AMP_DTYPE, HALF
     AMP_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[a.amp]
+    HALF = a.half
     if a.shard is not None:               # worker process, spawned by run()
         recipe = load_recipe(a.recipe or os.path.join(a.weights, "recipe.json"))
         df = pd.read_csv(os.path.join(a.out_dir, "series_list.csv"))
@@ -836,7 +869,7 @@ def main():
         run_shard(df, a.weights, recipe, os.path.join(a.out_dir, f"shard{a.shard}"), a.workers)
         return
     run(a.data_dir, a.weights, a.out_dir, a.submission, a.gpus.split(","), a.workers, a.series_dir,
-        a.series_csv, a.limit, a.recipe, a.amp)
+        a.series_csv, a.limit, a.recipe, a.amp, a.half)
 
 
 if __name__ == "__main__":

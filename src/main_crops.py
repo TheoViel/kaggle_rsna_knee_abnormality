@@ -34,13 +34,18 @@ DEFAULTS = {
     "labels": "claude",
     "fullfit": False,
     # K-fold (out-of-fold pseudo-labels, knee_cls.data.make_folds): validate on fold `fold` of `n_folds` over every
-    # training study, train on the others with the fullfit targets (radiologist labels on the 58). 0: off.
-    "n_folds": 0, "fold": 0,
+    # training study, train on the others. kfold_clean (default): the 58 and the holdout are never trained on and keep
+    # no radiologist label, so students of these pseudo-labels can still be validated on the 58. kfold_clean False:
+    # the old behaviour, fullfit targets (radiologist labels on the 58, holdout trained on) -- leaks into the 58. 0: off.
+    "n_folds": 0, "fold": 0, "kfold_clean": True,
     # Regularisation (crops.train.model_input / mix_batch): context crops (ctx > 1) with random
     # window shifts, random slice windows of depth_out slices, mixup / cutmix within a finding.
     # External data (OAI, see src/oai/): extra crop sets with their own labels; loss weight; OAI only
     # (pretraining); initial weights (fine-tuning); OAI sequences to keep.
     "extra_crops": "", "extra_labels": "", "extra_weight": 1.0, "extra_only": False, "init": "", "extra_seqs": "",
+    # Joint training: fraction of every epoch's items drawn from OAI crop sets ("oai*" sources); 0 = plain concatenation.
+    # The competition items (and other extra data, e.g. MRNet) are each seen once per epoch, OAI items fill the rest.
+    "oai_ratio": 0.0,
     # Multiple-instance meniscus bags (crops.train.PairDataset): series of a crop set whose exam has a tear
     # of unknown side (--mil_labels csv, StudyInstanceUID + --mil_col == 1); loss on max(medial, lateral).
     "mil_crops": "", "mil_labels": "", "mil_col": "mrnet_meniscus", "mil_weight": 1.0, "mil_bs": 4,
@@ -91,6 +96,30 @@ def parse_args():
     return a
 
 
+class RatioSampler(torch.utils.data.Sampler):
+    """Per epoch: every non-OAI item once, plus OAI items so that they make `ratio` of the epoch (drawn without
+    replacement while the OAI pool lasts), shuffled; each rank takes an equal slice (DistributedSampler's role)."""
+
+    def __init__(self, is_oai, ratio, num_replicas, rank, seed):
+        self.own, self.oai = np.flatnonzero(~is_oai), np.flatnonzero(is_oai)
+        assert self.own.size and self.oai.size and 0 < ratio < 1
+        self.n_own, self.n_oai = self.own.size, int(round(self.own.size * ratio / (1 - ratio)))
+        self.num_replicas, self.rank, self.seed, self.epoch = num_replicas, rank, seed, 0
+        self.per_rank = (self.n_own + self.n_oai) // num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed * 1000 + self.epoch)
+        e = rng.choice(self.oai, self.n_oai, replace=self.n_oai > self.oai.size)
+        idx = rng.permutation(np.concatenate([self.own, e]))[:self.per_rank * self.num_replicas]
+        return iter(idx[self.rank::self.num_replicas].tolist())
+
+    def __len__(self):
+        return self.per_rank
+
+
 def main():
     args = parse_args()
     ctx = init_distributed()
@@ -135,7 +164,11 @@ def main():
         assert not args.mixup and not args.cutmix and not args.mil_crops, "aux: no mixup / cutmix / MIL"
         al = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{args.aux_labels}.csv")).set_index("StudyInstanceUID")
         aux_t = {c: al[f"{c}|{args.aux}"] for c in classes if f"{c}|{args.aux}" in al}
-    if args.fullfit or args.n_folds:
+    if args.n_folds and args.kfold_clean:
+        # Clean k-fold: train on the other folds' training-split studies only, with the chosen soft labels.
+        valsplit = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
+        train_ds = CropDataset(crops, info[~val_mask & ~valsplit], classes, targets, aux_t)
+    elif args.fullfit or args.n_folds:
         # Fullfit (submission models): every study is trained on. The 58 radiologist studies
         # take their radiologist labels; every other study keeps the chosen soft labels.
         st_ = studies.set_index("StudyInstanceUID")
@@ -165,9 +198,14 @@ def main():
     else:
         train_ds = CropDataset(crops, info[~val_mask], classes, targets, aux_t)
     if extra is not None:
-        tr_info = extra if args.extra_only else pd.concat([info if args.fullfit else info[~val_mask], extra], ignore_index=True)
+        keep = ~val_mask
+        if args.n_folds and args.kfold_clean:
+            keep = keep & ~info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
+        own = info if args.fullfit else info[keep]
+        tr_info = extra if args.extra_only else pd.concat([own, extra], ignore_index=True)
         train_ds = CropDataset(crops, tr_info, classes, targets, aux_t)
-        train_ds.items["w"] = np.where(train_ds.items.src.isin(args.extra_crops.split(",")), args.extra_weight, 1.0)
+        ext_src = [x for x in args.extra_crops.split(",") if not (args.oai_ratio and x.startswith("oai"))]
+        train_ds.items["w"] = np.where(train_ds.items.src.isin(ext_src), args.extra_weight, 1.0)   # OAI: 1 with oai_ratio
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
     val_t = training_targets("claude", studies, classes)
     for c in classes:                     # "<ROI>|fracture": scored at study level (crops.train.study_auc)
@@ -178,13 +216,22 @@ def main():
     if ctx.is_main:
         if args.n_folds:
             print(f"-> K-FOLD {args.fold} / {args.n_folds}: validation = fold {args.fold} of every training study "
-                  f"({info[val_mask].StudyInstanceUID.nunique()} studies); the 58 are scored on their radiologist labels")
+                  f"({info[val_mask].StudyInstanceUID.nunique()} studies); the 58 are scored on their radiologist labels"
+                  + ("; clean: the 58 and the holdout are never trained on" if args.kfold_clean else "; NOT clean: fullfit targets"))
         if args.fullfit:
             print("-> FULLFIT: validation studies are trained on, validation scores below are leaky")
         print(f"-> {args.output_dir}  group {args.group} {classes}  backbone {args.backbone}\n"
               f"- train {len(train_ds)} crops  val {len(val_ds)} crops")
 
     def dl(ds, train):
+        if train and args.oai_ratio:
+            s = RatioSampler(ds.items.src.str.startswith("oai").to_numpy(), args.oai_ratio,
+                             ctx.world_size if ctx.distributed else 1, ctx.rank if ctx.distributed else 0, args.seed)
+            if ctx.is_main:
+                print(f"- OAI ratio {args.oai_ratio}: {s.n_own} competition + {s.n_oai} OAI items per epoch "
+                      f"(OAI pool {s.oai.size})")
+            return DataLoader(ds, batch_size=args.batch_size, sampler=s, drop_last=True, num_workers=args.num_workers,
+                              pin_memory=True, persistent_workers=True, worker_init_fn=worker_init_fn), s
         s = DistributedSampler(ds, shuffle=train, drop_last=train) if ctx.distributed else None
         return DataLoader(ds, batch_size=args.batch_size, sampler=s, shuffle=train and s is None, drop_last=train,
                           num_workers=args.num_workers, pin_memory=True, persistent_workers=True,

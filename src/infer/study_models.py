@@ -32,7 +32,7 @@ CLASSES = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "La
            "Synovitis", "Baker's", "Contusion", "Fracture"]
 PLANES = ["Sagittal", "Coronal", "Axial"]
 SLOTS = [("Sagittal", 1), ("Coronal", 1), ("Axial", 1), ("Sagittal", 0), ("Coronal", 0), ("Axial", 0)]
-Z_KEYS = ("depth", "z_mode", "stride", "size", "capsule", "capsule_up")
+Z_KEYS = ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "fullfov")   # fullfov: package.py, fov_d* sets
 WINDOW_CHUNK = 128         # frames per encoder call
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406))[None, :, None, None]
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225))[None, :, None, None]
