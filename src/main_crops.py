@@ -46,6 +46,12 @@ DEFAULTS = {
     # Joint training: fraction of every epoch's items drawn from OAI crop sets ("oai*" sources); 0 = plain concatenation.
     # The competition items (and other extra data, e.g. MRNet) are each seen once per epoch, OAI items fill the rest.
     "oai_ratio": 0.0,
+    # Train on fluid-sensitive (= fat-suppressed in this data) series only; validation keeps every series.
+    "fs_only": False,
+    "pairwise": 0.0,
+    # Series-level targets (pl.series_labels): CSV SeriesInstanceUID, cls, factor; positive training items (target >= 0.5)
+    # take target x factor, so series where the finding does not show get a lower target. "" = study label everywhere.
+    "series_labels": "",                      # weight of the pairwise AUC loss (crops.train.pairwise_auc_loss), 1 - it for BCE
     # Multiple-instance meniscus bags (crops.train.PairDataset): series of a crop set whose exam has a tear
     # of unknown side (--mil_labels csv, StudyInstanceUID + --mil_col == 1); loss on max(medial, lateral).
     "mil_crops": "", "mil_labels": "", "mil_col": "mrnet_meniscus", "mil_weight": 1.0, "mil_bs": 4,
@@ -164,6 +170,9 @@ def main():
         assert not args.mixup and not args.cutmix and not args.mil_crops, "aux: no mixup / cutmix / MIL"
         al = pd.read_csv(os.path.join(OUTPUT_FOLDER, "crops", f"{args.aux_labels}.csv")).set_index("StudyInstanceUID")
         aux_t = {c: al[f"{c}|{args.aux}"] for c in classes if f"{c}|{args.aux}" in al}
+    if args.fs_only:                      # training rows: fluid-sensitive series only; validation rows unchanged
+        keep_fs = info.Fluid_Sensitive.eq(1) | val_mask
+        info, val_mask = info[keep_fs], val_mask[keep_fs]
     if args.n_folds and args.kfold_clean:
         # Clean k-fold: train on the other folds' training-split studies only, with the chosen soft labels.
         valsplit = info.StudyInstanceUID.isin(set(gt_ids) | set(hold_ids))
@@ -206,6 +215,15 @@ def main():
         train_ds = CropDataset(crops, tr_info, classes, targets, aux_t)
         ext_src = [x for x in args.extra_crops.split(",") if not (args.oai_ratio and x.startswith("oai"))]
         train_ds.items["w"] = np.where(train_ds.items.src.isin(ext_src), args.extra_weight, 1.0)   # OAI: 1 with oai_ratio
+    if args.series_labels:
+        fac = pd.read_csv(args.series_labels).set_index(["SeriesInstanceUID", "cls"]).factor
+        it = train_ds.items
+        f = fac.reindex(pd.MultiIndex.from_arrays([it.SeriesInstanceUID, it.cls])).to_numpy()
+        m = (it.target.to_numpy() >= 0.5) & ~np.isnan(f)
+        it.loc[m, "target"] = it.target.to_numpy()[m] * f[m]
+        if ctx.is_main:
+            print(f"- series labels {args.series_labels}: {int(m.sum())} positive items rescaled "
+                  f"(mean factor {f[m].mean():.3f}); {int((it.target >= 0.5).sum())} items still >= 0.5")
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
     val_t = training_targets("claude", studies, classes)
     for c in classes:                     # "<ROI>|fracture": scored at study level (crops.train.study_auc)

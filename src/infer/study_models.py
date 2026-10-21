@@ -326,7 +326,11 @@ def predict_chunk(models, encoders, crop_rows, crops, amp_dtype):
     amp = dict(device_type="cuda", dtype=amp_dtype or torch.float16, enabled=amp_dtype is not None)
     plan = []                                       # (model, study, series indices)
     need = {}                                       # encoder -> frames to encode
+    out = []
     for m in models:
+        if m["kind"] == "roi":                      # multi-view ROI models: their own path (_predict_roi)
+            out += _predict_roi(m, encoders[m["encoder"]], crop_rows, crops, amp)
+    for m in [m for m in models if m["kind"] != "roi"]:
         x_all, have = crops[m["z"]]
         D = x_all.shape[2]
         for st, js in study_series(crop_rows, have, m["planes"]).items():
@@ -342,7 +346,6 @@ def predict_chunk(models, encoders, crop_rows, crops, amp_dtype):
             plan.append((m, st, js))
             need.setdefault(m["encoder"], set()).update(fr)
     feats = {name: _encode(encoders[name], crops[encoders[name]["z"]][0], fr, amp) for name, fr in need.items()}
-    out = []
     for m, st, js in plan:
         e, f = encoders[m["encoder"]], feats[m["encoder"]]
         dev = crops[m["z"]][0].device
@@ -371,6 +374,37 @@ def predict_chunk(models, encoders, crop_rows, crops, amp_dtype):
             out += [(m["name"], st, c, "Joint", float(q)) for c, q in zip(CLASSES, p[0].tolist())]
             continue
         out += [(m["name"], st, c, "Joint", float(q)) for c, q in zip(CLASSES, torch.sigmoid(p.float())[0].tolist())]
+    return out
+
+
+ROI_FINDINGS = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA", "PF OA", "Baker's"]
+
+
+def _predict_roi(m, e, crop_rows, crops, amp):
+    """Multi-view ROI model (main_study --model roi, study.RoiStudyDataset): per study and ROI k (crop channel k of
+    the 8-ROI crops = finding k of ROI_FINDINGS), StudyNet over that ROI's crop in every series of the study that has
+    it (sagittal / coronal first, then axial, at most max_series); the prediction is finding k's output.
+    -> rows (model, StudyInstanceUID, finding, "Joint", p)."""
+    x_all, have = crops[m["z"]]
+    D, dev = x_all.shape[2], x_all.device
+    out = []
+    for k, finding in enumerate(ROI_FINDINGS):
+        c = CLASSES.index(finding)
+        for st, js in study_series(crop_rows, have[:, k:k + 1], m["planes"]).items():
+            js = js[:m["max_series"]]
+            j = torch.tensor(js, device=dev)
+            f = torch.arange(D, device=dev)
+            trip = torch.stack([(f - 1).clamp(min=0), f, (f + 1).clamp(max=D - 1)], 1)         # (D, 3)
+            img = x_all[j][:, k][:, trip].float().div(255)                                      # (n, D, 3, S, S)
+            n = img.shape[0]
+            with torch.autocast(**amp):
+                v = e["net"].encoder(((img.flatten(0, 1) - e["net"].mean) / e["net"].std)).float()
+            x = v.view(n, D, -1)
+            plane, fs = _meta(crop_rows, js, dev)
+            mask = torch.ones((1, n), dtype=torch.bool, device=dev)
+            with torch.autocast(**amp):
+                p = e["net"].forward_features(x, plane[None], fs[None], mask, torch.zeros_like(plane)[None])
+            out.append((m["name"], st, finding, "Joint", float(torch.sigmoid(p.float())[0, c])))
     return out
 
 

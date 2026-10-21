@@ -54,6 +54,9 @@ def predict_run(run, device, crop_set=""):
     it = ds.items.assign(p=np.concatenate(ps))
     tab = it.groupby(["StudyInstanceUID", "cls"]).p.mean().unstack()
     tab.to_csv(os.path.join(d, f"{crop_set}_study_preds.csv" if crop_set else "all_study_preds.csv"))
+    if crop_set and "SeriesInstanceUID" in it:          # per series too (e.g. fluid-sensitive aggregation)
+        it[["StudyInstanceUID", "SeriesInstanceUID", "cls", "p"]].to_csv(os.path.join(d, f"{crop_set}_series_preds.csv"),
+                                                                       index=False)
     print(f"run {run}: {tab.shape[0]} studies x {list(tab.columns)}", flush=True)
 
 

@@ -473,6 +473,18 @@ def predict(model, loader, ds, device, amp=True, args=None):
     return out
 
 
+def pairwise_auc_loss(logit, y, group):
+    """B1-C1's ranking loss (src_study main_study.pairwise_auc_loss) over crop items: per group (the crop's finding /
+    ROI id), softplus(-(positive - negative logit)) over the batch's pairs (positive: soft target >= 0.5)."""
+    losses = []
+    for gid in group.unique():
+        k = group == gid
+        pos, neg = k & (y >= 0.5), k & (y < 0.5)
+        if pos.any() and neg.any():
+            losses.append(F.softplus(-(logit[pos, None] - logit[neg][None])).mean())
+    return torch.stack(losses).mean() if losses else logit.sum() * 0.0
+
+
 def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=None):
     device = ctx.device
     log = print if ctx.is_main else (lambda *a, **k: None)
@@ -517,6 +529,8 @@ def fit(model, train_dl, val_dl, val_ds, studies, args, ctx, sampler, mil_dl=Non
                 logit, logit2 = logit[:, 0], logit[:, 1]
             w = b["w"].to(device)                                   # extra-data (OAI) items can be down-weighted
             loss = (F.binary_cross_entropy_with_logits(logit[:n].float(), y, reduction="none") * w).sum() / w.sum()
+            if getattr(args, "pairwise", 0.0):                     # b1_c1's ranking loss, within each finding (ROI id)
+                loss = (1 - args.pairwise) * loss + args.pairwise * pairwise_auc_loss(logit[:n].float(), y, roi[:n])
             if aux:
                 # Auxiliary target of each crop; items without one (NaN) are masked, and the masked sum keeps the
                 # auxiliary head in every rank's graph (DDP).
