@@ -13,7 +13,7 @@ __pycache__/
 
 # Local data and benchmark artifacts
 datasets/
-input
+input/*
 output
 logs
 ensemble/
@@ -35,5 +35,11 @@ weights_val/
 *.pt
 *.pkl
 *.npy
-# Files kept in the repository
-!/data/**
+# Files of input/ kept in the repository
+!/input/full_claude_context_v2_labels.csv
+!/input/codex-labels_final_52.csv
+!/input/codex-labels_final_4349.csv
+!/input/pl_round1.csv
+!/input/pl_round2.csv
+!/input/series_laterality.csv
+!/input/rois.csv.gz

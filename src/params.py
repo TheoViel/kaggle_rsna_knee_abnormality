@@ -1,11 +1,9 @@
 INPUT_FOLDER = "../input/"
-DATA_FOLDER = "../data/"            # files kept in the repository (labels, ROI boxes, knee sides)
 LOG_FOLDER = "../logs/"
 OUTPUT_FOLDER = "../output/"
 
 TRAIN_CSV = INPUT_FOLDER + "train.csv"
-LABELS_FOLDER = DATA_FOLDER + "labels/"
-CLAUDE_LABELS_CSV = LABELS_FOLDER + "full_claude_context_v2_labels.csv"
+CLAUDE_LABELS_CSV = INPUT_FOLDER + "full_claude_context_v2_labels.csv"
 SERIES_INDEX_CSV = OUTPUT_FOLDER + "series_index.csv"
 
 # Raw series live in OUTPUT_FOLDER/series_npy as (slices, rows, cols) uint16/int16,

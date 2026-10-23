@@ -2,7 +2,7 @@
 
     python -m crops.prepare --boxes round3_pred --name r3
     python -m crops.prepare --boxes round3_axial --name r3_axial --volumes volumes_axial
-    python -m crops.prepare --boxes ../data/rois.csv.gz --name r3    # the repository's boxes (round 3, all planes)
+    python -m crops.prepare --boxes ../input/rois.csv.gz --name r3   # the repository's boxes (round 3, all planes)
 
 For every sagittal and coronal series and every ROI (`roi.extract.ROI_CLASSES`),
 from the series' 384 px uint8 cache (`prepare_cache.py`):
