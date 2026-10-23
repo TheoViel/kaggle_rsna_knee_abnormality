@@ -3,36 +3,34 @@
     python -m infer.pipeline --data_dir <dir with test_series/> --weights <dir> --out_dir /tmp/knee/ \
         --submission submission.csv --gpus 0,1
 
-<weights> holds side/ and roi/ (run folders), crops/<run>/ (args.json + ckpt_final.pt)
-and recipe.json ({finding: [crop run, ...]}, or {finding: {"models": [...], "minus": {"finding": f,
-"beta": b}}} to subtract b x finding f's combined score: the medial / lateral OA cross-talk
-correction, see experiments.md section 14).
+<weights> (rsna-knee-weights-1) holds side/ and roi/ (run folders), crops/<run>/ (args.json + ckpt_final.pt) and
+recipe.json ({finding: [crop run, ...]}).
 
-The operations of `infer.prep` -> `infer.side` -> `infer.seg` -> `infer.classify`,
-reorganised for a small machine (Kaggle: 2 x T4, 4 CPU cores):
-  - the studies are split between the GPUs, one process each, balanced on file count;
-  - CPU work is only reading the DICOMs, in DataLoader workers: the headers of every
-    file (slice order, geometry) and the pixels of the <= 64 slices the cache keeps;
-  - everything else runs on the GPU: percentile normalisation, padding and resizing
-    (the 384 px cache and the 32 x 128 x 128 volume), side classifier, ROI U-Net,
-    crop cutting, crop models;
-  - nothing goes through disk: studies are processed by chunks, and a chunk's caches
-    stay on the GPU until its crops are cut. Box consensus, registration fill and
-    axial boxes work within a knee, so chunking changes nothing;
-  - each crop model only predicts the findings the recipe takes from it;
-  - float16 autocast, fixed batch shapes (zero padded); crop sampling (frames, stride)
-    read from each crop model's args.json, crops cut once per distinct sampling.
-The shards' per-model study probabilities are then gathered and combined per the
-recipe (rank average over all test studies) into the submission; findings the
-recipe does not cover stay at 0.5.
+Steps, organised for a small machine (Kaggle: 2 x T4, 4 CPU cores):
+  0. input normalisation (`infer.sanitize`): plane names, and unusual DICOMs (compressed, multi-frame, RGB, several
+     files per slice position, no PixelSpacing) rewritten as plain files;
+  1. the studies are split between the GPUs, one process each, balanced on file count. CPU work is only reading the
+     DICOMs, in DataLoader workers: the headers of every file (slice order, geometry) and the pixels of the <= 64
+     slices the cache keeps;
+  2. everything else runs on the GPU, chunk by chunk of studies, nothing goes through disk:
+       - preprocessing as in training: percentile normalisation, padding, the 384 px cache (`prepare_cache.py`) and
+         the 32 x 128 x 128 volume (`roi.prepare`), in the training left-right convention;
+       - side classifier, per series (`side_cls.py`);
+       - ROI U-Net on sagittal / coronal series flipped to a right knee: one box per ROI and series, with a
+         confidence; weak boxes replaced by registration from the same knee's other series; axial boxes registered
+         from the sagittal / coronal ones (`roi.consensus`);
+       - crops (`crops.prepare.crop_window`), and the crop models, each on the findings the recipe takes from it.
+     float16 autocast, fixed batch shapes (zero padded).
+The shards' per-model study probabilities are then combined per the recipe (mean rank over all test studies) into the
+submission. Studies without a prediction for a finding (e.g. no sagittal / coronal series) get the finding's median;
+findings outside the recipe stay at 0.5.
 
-Writes to --out_dir: shard<i>/series.csv (series.csv of `infer.prep` + side,
-p_right), shard<i>/rois.csv (U-Net and axial boxes), shard<i>/preds.csv (model,
-StudyInstanceUID, cls, p), roi_study_preds.csv; and --submission.
+Writes to --out_dir: shard<i>/series.csv (series, side, status), shard<i>/rois.csv (U-Net and axial boxes),
+shard<i>/preds.csv (model, StudyInstanceUID, cls, p), roi_study_preds.csv (NaN where nothing was predicted); and
+--submission.
 """
 
 import argparse
-import contextlib
 import glob
 import json
 import os
@@ -44,7 +42,6 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
@@ -55,28 +52,8 @@ from roi.extract import ROI_CLASSES
 ROI_PLANES = ("Sagittal", "Coronal")
 VOL_DEPTH, VOL_SIZE = 32, 128            # roi.prepare.cache_to_volume
 SIDE_BATCH, UNET_BATCH, CROP_BATCH = 64, 16, 64
-# Whole-joint (capsule) crop models: 24 x 160 px items and one crop per series, so a smaller padded batch (memory on a
-# 16 GB T4: CAFormer-S18 needs 10.7 GB at 64, 2.7 GB at 16).
-CAPSULE_BATCH = 16
-HYBRID_GROUPS = 4                        # hybrid models: study groups (of `slots` series) per forward
-AMP_DTYPE = torch.float16                # hybrid models' autocast (--amp): float16 (T4), bfloat16 (as validated), None = fp32
-# --half: crop models with float16 weights and float16 inputs, no autocast (as the efficiency pipeline,
-# efficiency/pipeline.py): half the weight memory. Off: float32 weights under float16 autocast. The side model and the
-# ROI U-Net always stay float32 under autocast: in float16 the U-Net moved 14 / 1828 boxes by > 2 voxels.
-HALF = False
-
-
-def _amp():
-    """Precision context of the crop models: none in --half mode (the weights are float16)."""
-    return contextlib.nullcontext() if HALF else torch.autocast("cuda", dtype=torch.float16)
-
-
-def _dt():
-    return torch.float16 if HALF else torch.float32
-
-
-AUTOCAST = dict(device_type="cuda", dtype=torch.float16)   # side model, U-Net
 CHUNK = 24                               # studies per GPU chunk
+BOX = ["z0", "z1", "y0", "y1", "x0", "x1"]
 
 
 def list_series(data_dir, series_dir, series_csv):
@@ -90,9 +67,7 @@ def list_series(data_dir, series_dir, series_csv):
         df["Anatomical_Plane"] = ""
     df["folder"] = [os.path.join(data_dir, series_dir, r.StudyInstanceUID, r.SeriesInstanceUID)
                     for r in df.itertuples()]
-    if "Fluid_Sensitive" not in df:        # "name@FS" recipe entries: no flag -> every study falls back to all series
-        df["Fluid_Sensitive"] = np.nan
-    return df[["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder", "Fluid_Sensitive"]]
+    return df[["StudyInstanceUID", "SeriesInstanceUID", "Anatomical_Plane", "folder"]]
 
 
 def shard_studies(df, n):
@@ -113,13 +88,12 @@ def shard_studies(df, n):
 def read_series(folder, plane):
     """Headers of every slice, pixels of the slices the cache keeps -> raw volume + metadata.
 
-    Same slices, order and majority-shape rule as `infer.prep.read_series` +
-    `prepare_cache.preprocess_volume`'s slice subsampling.
+    Same slice order as the training arrays (`prepare_data.py`) and the same slice subsampling as
+    `prepare_cache.preprocess_volume`.
     """
     import pydicom
 
-    from infer.prep import pixel_spacing, slice_order, to_monochrome2
-    from knee_registration import geometry_from_slices
+    from dicom_io import pixel_spacing, slice_order, to_monochrome2
 
     files = sorted(glob.glob(os.path.join(folder, "*.dcm")))
     # Short series (most): one full read. Longer ones: headers first, pixels of the kept slices only.
@@ -136,10 +110,10 @@ def read_series(folder, plane):
     kept = np.round(np.linspace(0, n - 1, CACHE_MAX_SLICES)).astype(int) if n > CACHE_MAX_SLICES else range(n)
     arrs = [(dss[i] if full else pydicom.dcmread(files[i])).pixel_array for i in kept]
     vol = np.stack([a[0] if a.ndim == 3 and a.shape[0] == 1 else a for a in arrs])
-    vol = to_monochrome2(vol, [dss[i] for i in kept])        # MONOCHROME1 slices inverted
+    vol = to_monochrome2(vol, [dss[i] for i in kept])
     plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
-    geom = geometry_from_slices([d.ImageOrientationPatient for d in dss], [d.ImagePositionPatient for d in dss],
-                                pixel_spacing(dss[0]), dss[0].get("SliceThickness"))
+    geom = kr.geometry_from_slices([d.ImageOrientationPatient for d in dss], [d.ImagePositionPatient for d in dss],
+                                   pixel_spacing(dss[0]), dss[0].get("SliceThickness"))
     d = np.array(geom["direction"]).reshape(3, 3)
     # Training convention: sagittal slices towards patient right (-x), columns towards left (+x).
     conv_flip = bool(d[0, 2] > 0) if plane == "Sagittal" else bool(d[0, 0] < 0)
@@ -164,8 +138,7 @@ class StudyDataset(Dataset):
         study, g = self.studies[i]
         out = []
         for r in g.itertuples():
-            base = dict(StudyInstanceUID=study, SeriesInstanceUID=r.SeriesInstanceUID,
-                        fluid=getattr(r, "Fluid_Sensitive", np.nan))
+            base = dict(StudyInstanceUID=study, SeriesInstanceUID=r.SeriesInstanceUID)
             try:
                 raw, unsigned, meta, geom = read_series(r.folder, r.Anatomical_Plane)
                 out.append(dict(**base, **meta, status="ok", raw=raw, unsigned=unsigned, geom=geom))
@@ -216,39 +189,73 @@ def _lr_axis(plane):
     return 0 if plane == "Sagittal" else 2          # of a (D, S, S) volume
 
 
-def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal, depth=12, z_mode="uniform", stride=1,
-              size=128, classes=ROI_CLASSES, margin=None):
-    """`crops.prepare.crop_box` of every class with a box -> (K, depth, size, size) uint8, have (K,)."""
-    from crops.prepare import MARGIN, crop_window
+def gpu_crops(cache, boxes, n_slices, rows, cols, flip, sagittal):
+    """`crops.prepare.crop_box` of every ROI with a box -> (K, DEPTH, SIZE, SIZE) uint8, have (K,)."""
+    from crops.prepare import DEPTH, SIZE, crop_window
 
-    SIZE = size
-    margin = MARGIN if margin is None else margin
     n_c, cs = cache.shape[0], cache.shape[1]
-    out = torch.zeros((len(classes), depth, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
-    have = np.zeros(len(classes), bool)
-    for k, c in enumerate(classes):
+    out = torch.zeros((len(ROI_CLASSES), DEPTH, SIZE, SIZE), dtype=torch.uint8, device=cache.device)
+    have = np.zeros(len(ROI_CLASSES), bool)
+    for k, c in enumerate(ROI_CLASSES):
         if c not in boxes:
             continue
-        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols, depth, margin=margin, z_mode=z_mode,
-                                    stride=stride)
-        win = torch.zeros((depth, n, n), dtype=torch.float32, device=cache.device)
+        zs, y0, x0, n = crop_window(n_c, cs, boxes[c], n_slices, rows, cols)
+        win = torch.zeros((DEPTH, n, n), dtype=torch.float32, device=cache.device)
         ys, xs, ye, xe = max(y0, 0), max(x0, 0), min(y0 + n, cs), min(x0 + n, cs)
         if ye > ys and xe > xs:
-            if zs.dtype.kind == "f":          # resize: linear between the two nearest slices
-                lo = np.floor(zs).astype(int)
-                hi = np.minimum(lo + 1, n_c - 1)
-                w = torch.as_tensor(zs - lo, dtype=torch.float32, device=cache.device)[:, None, None]
-                sub = (1 - w) * cache[torch.as_tensor(lo, device=cache.device)][:, ys:ye, xs:xe].float() + \
-                    w * cache[torch.as_tensor(hi, device=cache.device)][:, ys:ye, xs:xe].float()
-            else:
-                sub = cache[torch.as_tensor(zs, device=cache.device)][:, ys:ye, xs:xe]
-            win[:, ys - y0:ye - y0, xs - x0:xe - x0] = sub
+            win[:, ys - y0:ye - y0, xs - x0:xe - x0] = cache[torch.as_tensor(zs, device=cache.device)][:, ys:ye, xs:xe]
         t = F.interpolate(win[:, None], size=(SIZE, SIZE), mode="bilinear", antialias=True, align_corners=False)[:, 0]
         t = t.round().clamp(0, 255).to(torch.uint8)
         if flip:
             t = t.flip(0) if sagittal else t.flip(2)
         out[k], have[k] = t, True
     return out, have
+
+
+# --------------------------------------------------------------------- boxes
+
+
+def consensus(pred, rows):
+    """U-Net boxes of whole studies -> rois rows: per-box confidence, failures filled by registration.
+
+    rows: the studies' sagittal / coronal series (+ side). Works knee by knee -- the series of a study with the same
+    predicted side, so a bilateral study never mixes its knees -- so any set of whole studies gives the same result.
+    """
+    from roi.consensus import add_confidence, fill_by_registration
+
+    knee = lambda d: d.StudyInstanceUID + "|" + d.side  # noqa: E731
+    pred["study"] = pred.StudyInstanceUID
+    pred["StudyInstanceUID"] = knee(pred)
+    pred = add_confidence(pred)
+    weak = pred.conf < 0.5
+    knees = rows.assign(StudyInstanceUID=knee(rows), Anatomical_Plane=rows.plane)
+    filled, _ = fill_by_registration(pred.assign(source="unet"), knees, ~weak, weak)
+    filled["StudyInstanceUID"] = filled.StudyInstanceUID.str.split("|").str[0]
+    filled["side"] = filled.SeriesInstanceUID.map(rows.set_index("SeriesInstanceUID").side)
+    cols = ["StudyInstanceUID", "SeriesInstanceUID", "plane", "side", "class"] + BOX + \
+        ["conf", "p_mean", "support", "iou_other_plane", "iou_same_plane", "confidence", "source"]
+    return filled.reindex(columns=cols).sort_values(["StudyInstanceUID", "SeriesInstanceUID", "class"])
+
+
+def axial_boxes(series, rois, side):
+    """ROI boxes of the axial series, registered from the same knee's sagittal / coronal boxes (`crops.axial_boxes`)."""
+    from roi.consensus import _world, registered_box
+
+    r = rois.copy()
+    r["world"] = _world(r)
+    r["knee"] = r.StudyInstanceUID + "|" + r.side
+    by_knee = dict(tuple(r.groupby("knee")))
+    out = []
+    for t in series[(series.status == "ok") & (series.plane == "Axial")].itertuples():
+        src = by_knee.get(f"{t.StudyInstanceUID}|{side.get(t.SeriesInstanceUID)}")
+        if src is None:
+            continue
+        for cls, s in src.groupby("class"):
+            box = registered_box(t, s.assign(confidence=s.confidence.fillna(0)))
+            if box is not None:
+                out.append(dict(StudyInstanceUID=t.StudyInstanceUID, SeriesInstanceUID=t.SeriesInstanceUID,
+                                plane="Axial", **{"class": cls}, **box))
+    return pd.DataFrame(out)
 
 
 # ------------------------------------------------------------------------ models
@@ -259,98 +266,9 @@ def _padded(x, n):
     return x if len(x) == n else torch.cat([x, x.new_zeros((n - len(x),) + x.shape[1:])])
 
 
-def flat(models):
-    """A recipe entry's models, nested lists (seed groups / sub-ensembles) flattened."""
-    return [m for x in models for m in (flat(x) if isinstance(x, list) else [x])]
-
-
-def load_hybrid(d, name, device):
-    """A hybrid multitask model folder (<weights>/mt3d/<name>: args.json, ckpt_final.pt, crop.json; trained with
-    src_bis/mt3d) -> its network, as validated. Inference code: mt3d/hybrid.py (copied from src_bis/mt3d)."""
-    from mt3d.hybrid import Hybrid, PairHybrid
-
-    a = json.load(open(os.path.join(d, "args.json")))
-    assert a["arch"] == "hybrid" and a["pair"] and a.get("w_anat", 0) == 0 and not a.get("zoom") \
-        and a.get("pool", "pred") == "pred" and a.get("findings", "roi8") == "roi8", f"unsupported hybrid run {d}"
-    base = Hybrid(a["backbone"], frames=a["frames"], dec=a["dec"], dim=a["dim"], tf_layers=a["tf_layers"],
-                  pretrained=False, levels=[int(v) for v in str(a["levels"]).split(",")], nb=a.get("nb", 1), zoom=[])
-    net = PairHybrid(base, a["slots"])
-    net.load_state_dict(torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu"))
-    crop = json.load(open(os.path.join(d, "crop.json")))          # the joint crop it was trained on
-    return dict(name=name, net=net.to(device).eval(), slots=a["slots"], size=a["size"], depth=crop["depth"],
-                crop=dict(expand=crop["expand"], depth=crop["depth"], size=crop["size"]))
-
-
-def hybrid_crops(rows, rois, crop):
-    """Joint crops (src_bis mt3d.prepare: the union of the 8 ROI boxes + expand) of the sagittal / coronal series
-    with all 8 ROI boxes -> (series rows kept, (N, depth, size, size) uint8 on the GPU)."""
-    from crops.prepare import capsule_boxes
-
-    rows = [s for s in rows if s["plane"] in ROI_PLANES]
-    n_cls = rois.groupby("SeriesInstanceUID")["class"].nunique() if len(rois) else pd.Series(dtype=int)
-    rows = [s for s in rows if n_cls.get(s["SeriesInstanceUID"], 0) == len(ROI_CLASSES)]
-    if not rows:
-        return [], None
-    shape = {s["SeriesInstanceUID"]: (s["rows"], s["cols"]) for s in rows}
-    union = capsule_boxes(rois[rois.SeriesInstanceUID.isin(shape)], crop["expand"], None, shape)
-    out = torch.stack([gpu_crops(s["cache"], union[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
-                                 (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", depth=crop["depth"],
-                                 z_mode="resize", size=crop["size"], classes=["Capsule"], margin=0.0)[0][0]
-                       for s in rows])
-    return rows, out
-
-
-def study_groups(rows, slots):
-    """Series of each study -> the hybrid's validation groups (src_bis mt3d.train.PairDataset): sagittal and coronal
-    interleaved in series order, chunks of `slots`, missing slots repeat the first series (masked as invalid)."""
-    by = {}
-    for i, s in enumerate(rows):
-        by.setdefault(s["StudyInstanceUID"], ([], []))[0 if s["plane"] == "Sagittal" else 1].append(i)
-    groups = []
-    for st, (sag, cor) in by.items():
-        order = []
-        for j in range(max(len(sag), len(cor))):
-            order += ([sag[j]] if j < len(sag) else []) + ([cor[j]] if j < len(cor) else [])
-        for j in range(0, len(order), slots):
-            g = order[j:j + slots]
-            groups.append((st, g + [g[0]] * (slots - len(g)), [True] * len(g) + [False] * (slots - len(g))))
-    return groups
-
-
-@torch.no_grad()
-def hybrid_predict(h, rows, crops):
-    """One hybrid model over the joint crops -> [(model, study, finding, plane, p)]: mean over the study's groups
-    (plane "Joint": one prediction per study, not per series)."""
-    from mt3d.hybrid import PLANES as H_PLANES
-
-    dev, out = crops.device, []
-    groups = study_groups(rows, h["slots"])
-    plane = torch.tensor([H_PLANES.index(s["plane"]) for s in rows], device=dev)
-    for i in range(0, len(groups), HYBRID_GROUPS):
-        part = groups[i:i + HYBRID_GROUPS]
-        n = len(part)
-        idx = torch.tensor([j for _, g, _ in part for j in g], device=dev)
-        valid = torch.tensor([v for _, _, v in part], device=dev)
-        x = crops[idx].float()[:, None] / 255                                  # (n * slots, 1, D, S, S)
-        if x.shape[-1] != h["size"]:                                           # as src_bis mt3d.train.prepare_batch
-            x = F.interpolate(x, size=(x.shape[2], h["size"], h["size"]), mode="trilinear", align_corners=False)
-        pad = HYBRID_GROUPS - n                                                # fixed shapes
-        x = _padded(x, HYBRID_GROUPS * h["slots"])
-        pl = _padded(plane[idx], HYBRID_GROUPS * h["slots"])
-        valid = torch.cat([valid, torch.ones((pad, h["slots"]), dtype=torch.bool, device=dev)]) if pad else valid
-        with torch.autocast("cuda", dtype=AMP_DTYPE or torch.float16, enabled=AMP_DTYPE is not None):
-            p = torch.sigmoid(h["net"](x, pl, None, valid)["cls"].float())[:n].cpu().numpy()
-        out += [(st, p[k]) for k, (st, _, _) in enumerate(part)]
-    rows_out = []
-    for st in dict.fromkeys(st for st, _ in out):
-        p = np.mean([q for s2, q in out if s2 == st], 0)
-        rows_out += [(h["name"], st, c, "Joint", float(v)) for c, v in zip(ROI_CLASSES, p)]
-    return rows_out
-
-
 class Models:
     def __init__(self, weights, recipe, device):
-        from crops.train import GROUPS, PLANES, build_model as build_crop_model, crop_index, finding_of
+        from crops.train import GROUPS, PLANES, Crop25D
         from roi.train import build_model
         from side_cls import SideNet
 
@@ -360,111 +278,41 @@ class Models:
         self.side.load_state_dict(sd)
         self.side = self.side.to(device).eval()
         sd = torch.load(os.path.join(weights, "roi", "ckpt_final.pt"), map_location="cpu")
-        k = sd["decoder.seg_layers.4.weight"].shape[0]
-        self.roi_classes = ROI_CLASSES[:k]
-        self.unet = build_model(num_classes=k)
+        self.unet = build_model(num_classes=len(ROI_CLASSES))
         self.unet.load_state_dict(sd)
         self.unet = self.unet.to(device).eval()
-        self.crops, self.hybrids = [], []
-        # Entries may be nested lists (seed groups, combine()); "<name>" under <weights>/mt3d/ is a hybrid model.
-        refs = {m for r in recipe.values() for m in flat(r["models"])}
-        # "name@Plane1,Plane2" entries: (entry, model, planes), averaged in process_chunk.
-        # "name@FS": the model's mean over the study's fluid-sensitive series (Fluid_Sensitive == 1 in the series csv),
-        # all its series when the study has none (bone-marrow edema shows on fluid-sensitive series only).
-        self.restricted = [(x, x.split("@")[0], x.split("@")[1].split(",")) for x in sorted(refs) if "@" in x]
-        self.fs_refs = {}
-        for x, base, planes in self.restricted:
-            if planes == ["FS"]:
-                self.fs_refs.setdefault(base, []).append(x)
-        # "shared8": the teammate's four-model ROI ensemble in <weights>/shared8/ (infer.shared8), not a crop model.
-        self.shared8 = os.path.join(weights, "shared8") if "shared8" in {x.split("@")[0] for x in refs} else None
-        self.shared8_holder, self.shared8_out_dir = {}, None
-        # "<name>" under <weights>/study/: a study-level model of src_study (infer.study_models), one row per study.
-        study_names = {x.split("@")[0] for x in refs if os.path.isdir(os.path.join(weights, "study", x.split("@")[0]))}
-        self.studies, self.study_encoders = [], {}
-        if study_names:
-            from infer import study_models
-            self.studies, self.study_encoders = study_models.load(weights, study_names, device)
-        # "<name>" under <weights>/embheads/: a head on frozen crop-model features (infer.emb_heads); its source crop
-        # models run as usual and also keep the features of the crops it reads (also when the recipe does not use them).
-        emb_names = {x.split("@")[0] for x in refs if os.path.isdir(os.path.join(weights, "embheads", x.split("@")[0]))}
-        self.emb_heads, self.emb_needs = [], {}
-        if emb_names:
-            assert not HALF, "--half: embedding heads read float32 crop-model features, not supported"
-            from infer import emb_heads
-            self.emb_heads, self.emb_needs = emb_heads.load(weights, emb_names, device)
-        for m in sorted(({x.split("@")[0] for x in refs} - emb_names) | set(self.emb_needs)):
-            if m == "shared8" or m in study_names:
-                continue
-            if os.path.isdir(os.path.join(weights, "mt3d", m)):
-                self.hybrids.append(load_hybrid(os.path.join(weights, "mt3d", m), m, device))
-                continue
+        self.crops = []
+        for m in sorted({m for ms in recipe.values() for m in ms}):
             d = os.path.join(weights, "crops", m)
             a = json.load(open(os.path.join(d, "args.json")))
             group = GROUPS[a["group"]]
             sd = torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu")
-            net = build_crop_model(a, len(group))
-            n_planes = sd["plane_embed.weight"].shape[0]
-            if n_planes != net.plane_embed.num_embeddings:     # runs from before axial crops: 2 planes
-                net.plane_embed = nn.Embedding(n_planes, net.plane_embed.embedding_dim)
+            net = Crop25D(a["backbone"], len(group), pretrained=False, img_size=a.get("img_size") or None,
+                          hidden=a.get("hidden", 256), dropout=0.0, drop_path=0.0, head=a.get("head", "lstm"))
             net.load_state_dict(sd)
-            net = net.to(device, _dt()).eval()
-            if a["backbone"] not in ("roi_unet3d", "roi_unet3d_scratch"):    # 2D encoders only
-                net = net.to(memory_format=torch.channels_last)
-            takes = {f for f, r in recipe.items() if any(x.split("@")[0] == m for x in flat(r["models"]))}   # findings from it
-            takes |= self.emb_needs.get(m, set())                # crops read by embedding heads
-            if any(f.startswith("_") for f in takes):             # "_<name>" entries (e.g. "_oai"): run for the notebook's
-                takes |= set(group)                              # blends, every finding of the model, no recipe column
-            aux = finding_of(a["aux"]) if a.get("aux") else None
-            if aux in takes:          # auxiliary per-ROI output (e.g. fracture): needs every ROI crop of the model
-                used = list(group)
-            else:                     # its own findings, and per-ROI sub-targets ("<ROI>|fracture") of findings taken from it
-                used = [c for c in group if c in takes or ("|" in c and finding_of(c.split("|")[1]) in takes)]
-            z = a.get("z_sampling") or dict(depth=12, z_mode="uniform", stride=1)    # older runs: uniform 12
-            z = {k: z[k] for k in ("depth", "z_mode", "stride", "size", "capsule", "capsule_up", "margin",
-                                   "compartment", "oa_midline", "union", "fibula", "bones") if k in z}
-            self.crops.append(dict(name=m, net=net, z=json.dumps(z, sort_keys=True), planes=a["planes"].split(","),
-                                   batch=CAPSULE_BATCH if "capsule" in z else CROP_BATCH,
-                                   aux=a["aux"] if a.get("aux") else None,
-                                   planes_all=PLANES,
-                                   rois={c: (crop_index(c, "capsule" in z), group.index(c)) for c in used}))
-
-
-    def _warm_crops(self):
-        z, dt = torch.zeros, _dt()
-        for m in self.crops:
-            i = z(m["batch"], dtype=torch.long, device=self.device)
-            k = json.loads(m["z"])
-            m["net"](z((m["batch"], k["depth"], k.get("size", 128), k.get("size", 128)), device=self.device, dtype=dt),
-                     i, i)
+            net = net.to(device).eval().to(memory_format=torch.channels_last)
+            used = [c for c in group if m in recipe.get(c, [])]     # findings the recipe takes from it
+            self.crops.append(dict(name=m, net=net, planes=a["planes"].split(","), planes_all=PLANES,
+                                   rois={c: (ROI_CLASSES.index(c), group.index(c)) for c in used}))
 
     @torch.no_grad()
     def warmup(self):
         """One dummy batch through every network: CUDA / cuDNN first-call costs, out of the timings."""
+        from crops.prepare import DEPTH, SIZE
+
         z = torch.zeros
-        with torch.autocast(**AUTOCAST):  # without --half the crop models stay in this same context (as before)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
             self.side(z((SIDE_BATCH, 4, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
             self.unet(z((UNET_BATCH, 1, VOL_DEPTH, VOL_SIZE, VOL_SIZE), device=self.device))
-            if not HALF:
-                self._warm_crops()
-        if HALF:
-            self._warm_crops()
-        # Only with hybrids: an extra autocast context shifts the fp16 numerics of later models (CAFormer, ~1e-4).
-        if self.hybrids:
-            with torch.autocast("cuda", dtype=AMP_DTYPE or torch.float16, enabled=AMP_DTYPE is not None):
-                for h in self.hybrids:
-                    n = HYBRID_GROUPS * h["slots"]
-                    h["net"](z((n, 1, h["depth"], h["size"], h["size"]), device=self.device),
-                             z(n, dtype=torch.long, device=self.device), None,
-                             torch.ones((HYBRID_GROUPS, h["slots"]), dtype=torch.bool, device=self.device))
+            for m in self.crops:
+                i = z(CROP_BATCH, dtype=torch.long, device=self.device)
+                m["net"](z((CROP_BATCH, DEPTH, SIZE, SIZE), device=self.device), i, i)
         torch.cuda.synchronize()
 
 
 @torch.no_grad()
 def process_chunk(studies, models, timer):
     """A list of studies (StudyDataset items, caches already on the GPU) -> series rows, rois, preds."""
-    from infer.classify import axial_boxes
-    from infer.seg import consensus
     from roi.geometry import from_volume
     from roi.train import prob_to_boxes
     from side_cls import PLANES as SIDE_PLANES, model_input
@@ -481,7 +329,7 @@ def process_chunk(studies, models, timer):
         part = ser[i:i + SIDE_BATCH]
         x = _padded(torch.stack([s["volume"] for s in part])[:, None], SIDE_BATCH)
         pl = _padded(torch.tensor([SIDE_PLANES.index(s["plane"]) for s in part], device=dev), SIDE_BATCH)
-        with torch.autocast(**AUTOCAST):
+        with torch.autocast(**amp):
             p_right.append(torch.sigmoid(models.side(model_input(x, pl)).float())[:len(part)].cpu())
     p_right = torch.cat(p_right).numpy() if ser else np.zeros(0)
     for s, p in zip(ser, p_right):
@@ -496,29 +344,24 @@ def process_chunk(studies, models, timer):
     for i in range(0, len(seg), UNET_BATCH):
         part = seg[i:i + UNET_BATCH]
         x = torch.stack([s["volume"].flip(_lr_axis(s["plane"])) if s["side"] == "L" else s["volume"] for s in part])
-        with torch.autocast(**AUTOCAST):
+        with torch.autocast(**amp):
             prob = torch.sigmoid(models.unet(_padded(x[:, None], UNET_BATCH).float() / 255).float())
         prob = torch.stack([prob[j].flip(_lr_axis(s["plane"]) + 1) if (s["side"] == "L") ^ s["conv_flip"]
                             else prob[j] for j, s in enumerate(part)]).cpu().numpy()
-        timer["unet"] += time.time() - t
-        t = time.time()
         for s, p in zip(part, prob):
             for k, (vb, conf, p_mean) in enumerate(prob_to_boxes(p, 0.5)):
                 pred.append(dict(StudyInstanceUID=s["StudyInstanceUID"], SeriesInstanceUID=s["SeriesInstanceUID"],
-                                 plane=s["plane"], side=s["side"], **{"class": models.roi_classes[k]}, conf=conf,
+                                 plane=s["plane"], side=s["side"], **{"class": ROI_CLASSES[k]}, conf=conf,
                                  p_mean=p_mean, **from_volume(vb, s["n_slices"], s["n_cache"], s["rows"], s["cols"],
                                                               *p.shape[1:3])))
-        timer["boxes"] += time.time() - t
-        t = time.time()
+    timer["unet"] += time.time() - t
 
     # Consensus and registration fill within a knee, then the axial series' boxes.
     t = time.time()
     meta_cols = ["StudyInstanceUID", "SeriesInstanceUID", "plane", "n_slices", "n_cache", "rows", "cols",
                  "conv_flip", "side", "status"]
     series = pd.DataFrame([{k: s.get(k) for k in meta_cols} for s in ser], columns=meta_cols)
-    rois = pd.DataFrame()
-    if pred:
-        rois, _, _ = consensus(pd.DataFrame(pred), series[series.plane.isin(ROI_PLANES)])
+    rois = consensus(pd.DataFrame(pred), series[series.plane.isin(ROI_PLANES)]) if pred else pd.DataFrame()
     side = dict(zip(series.SeriesInstanceUID, series.side))
     ax = axial_boxes(series, rois, side) if len(rois) else pd.DataFrame()
     boxes = pd.concat([rois, ax], ignore_index=True)
@@ -528,167 +371,40 @@ def process_chunk(studies, models, timer):
     t = time.time()
     by_series = {}
     for r in boxes.to_dict("records"):
-        by_series.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in
-                                                                        ["z0", "z1", "y0", "y1", "x0", "x1"]}
+        by_series.setdefault(r["SeriesInstanceUID"], {})[r["class"]] = {k: int(r[k]) for k in BOX}
     crop_rows = [s for s in ser if s["SeriesInstanceUID"] in by_series]
-    crops = {}                            # sampling -> (crops (N, K, D, S, S), have (N, K))
-    study_z = {m["z"] for m in models.studies} | {e["z"] for e in models.study_encoders.values()}
-    for z in {m["z"] for m in models.crops} | study_z:
-        kw = json.loads(z)
-        cap, cap_up = kw.pop("capsule", None), kw.pop("capsule_up", None)
-        compartment, midline = kw.pop("compartment", None), kw.pop("oa_midline", "")
-        union = [c for c in kw.pop("union", "").split(",") if c]
-        fibula = kw.pop("fibula", False)
-        bones = kw.pop("bones", False)
-        fullfov = kw.pop("fullfov", False)
-        if fullfov:                       # whole-volume crops (crops.prepare --boxes fullfov --capsule 0): every slice,
-            series_boxes = {s["SeriesInstanceUID"]: {"Capsule": dict(z0=0, z1=s["n_slices"] - 1, y0=0, y1=s["rows"] - 1,
-                                                                     x0=0, x1=s["cols"] - 1)} for s in crop_rows}
-            kw.update(classes=["Capsule"], margin=0.0)        # the full field of view, no margin
-        elif fibula:                        # 9 ROIs: + the fibular head, derived from the series' boxes (fracture.fibula)
-            from fracture.fibula import fibula_box
-            if bones:                     # 13 ROIs: + 4 bone boxes, distal femur / proximal tibia (fracture.bones)
-                from fracture.bones import BONES, bone_boxes
-
-            series_boxes = {}
-            for s in crop_rows:
-                bx = dict(by_series.get(s["SeriesInstanceUID"], {}))
-                if s["plane"] in ("Sagittal", "Coronal"):
-                    fb = fibula_box(bx, s["plane"], s["rows"], s["cols"], s["n_slices"])
-                    if fb is not None:
-                        bx["Fibula"] = fb
-                    if bones:
-                        bx.update(bone_boxes(by_series.get(s["SeriesInstanceUID"], {}), s["plane"], s["rows"], s["cols"],
-                                             s["n_slices"]))
-                series_boxes[s["SeriesInstanceUID"]] = bx
-            kw.update(classes=ROI_CLASSES + ["Fibula"] + (BONES if bones else []))
-        elif cap is not None:               # effusion / synovitis: one capsule crop around the ROI union
-            from crops.prepare import capsule_boxes
-
-            shape = {s["SeriesInstanceUID"]: (s["rows"], s["cols"]) for s in crop_rows}
-            src = boxes[boxes.SeriesInstanceUID.isin(shape)]      # axial: union of its registered boxes
-            series_boxes = capsule_boxes(src, cap, cap_up, shape, union or None)
-            kw.update(classes=["Capsule"], margin=0.0)
-        else:
-            series_boxes = by_series
-            if compartment is not None or midline:
-                # OA compartment crops, exactly as crops.prepare --compartment / --oa_midline built them.
-                from crops.prepare import compartment_box, oa_midline
-
-                series_boxes = {}
-                for s in crop_rows:
-                    uid = s["SeriesInstanceUID"]
-                    bx = dict(by_series.get(uid, {}))
-                    if compartment is not None and s["plane"] != "Axial":
-                        for oa, men in (("Medial OA", "Medial Meniscus"), ("Lateral OA", "Lateral Meniscus")):
-                            if oa in bx and men in bx:
-                                bx[oa] = compartment_box(bx[oa], bx[men], compartment, (s["rows"], s["cols"]))
-                    if midline and s["plane"] in ("Coronal", "Axial"):
-                        bx = oa_midline(bx, clip=midline == "clip")
-                    series_boxes[uid] = bx
-        cs, have = [], []
-        for s in crop_rows:
-            c, h = gpu_crops(s["cache"], series_boxes.get(s["SeriesInstanceUID"], {}), s["n_slices"], s["rows"],
-                             s["cols"], (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal", **kw)
-            cs.append(c)
-            have.append(h)
-        if cs:
-            crops[z] = torch.stack(cs), np.stack(have)
+    cs, have = [], []
+    for s in crop_rows:
+        c, h = gpu_crops(s["cache"], by_series[s["SeriesInstanceUID"]], s["n_slices"], s["rows"], s["cols"],
+                         (s["side"] == "L") ^ s["conv_flip"], s["plane"] == "Sagittal")
+        cs.append(c)
+        have.append(h)
     torch.cuda.synchronize()
     timer["crops"] += time.time() - t
 
     # Crop models: every (series, ROI) of the planes and findings each one is used for.
+    t = time.time()
     out = []
-    emb_store = {}                        # (model, series, class) -> (crop vector, frame features), for embedding heads
-    for m in models.crops if crop_rows else []:
-        t = time.time()
-        x_all, have = crops[m["z"]]
-        items = [(j, roi, rid, m["planes_all"].index(s["plane"]), s["StudyInstanceUID"], c)
-                 for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
-                 for c, (roi, rid) in m["rois"].items() if have[j, roi]]
-        nb = m["batch"]
-        for i in range(0, len(items), nb):
-            part = items[i:i + nb]
-            j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
-            x = (_padded(x_all[j, roi], nb).float() / 255).to(_dt())
-            need = models.emb_needs.get(m["name"], set())
-            with _amp():
-                if any(c in need for *_, c in part):          # the same pass, also returning the features
-                    from infer import emb_heads
-                    assert not m["aux"], "embedding heads on auxiliary-output crop models are not supported"
-                    lg, e, f0 = emb_heads.forward_with_features(m["net"], x, _padded(rid, nb), _padded(pl, nb))
-                    p = torch.sigmoid(lg.float())
-                    for i_, (j_, *_, c) in enumerate(part):
-                        if c in need:
-                            emb_store[(m["name"], crop_rows[j_]["SeriesInstanceUID"], c)] = (e[i_].float(), f0[i_].float())
-                else:
-                    p = torch.sigmoid(m["net"](x, _padded(rid, nb), _padded(pl, nb),
-                                               **({"both": True} if m["aux"] else {})).float())
-            if m["aux"]:              # (main, auxiliary) per item; the auxiliary row is "<finding>|<aux>"
-                p, p2 = p[:, 0], p[:, 1]
-                out += [(m["name"], st, f"{c}|{m['aux']}", m["planes_all"][pl_], float(v))
-                        for (_, _, _, pl_, st, c), v in zip(part, p2[:len(part)].tolist())]
-            out += [(m["name"], st, c, m["planes_all"][pl_], float(v))
-                    for (_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist())]
-            for ref in models.fs_refs.get(m["name"], []):      # "name@FS": the fluid-sensitive series' rows again
-                out += [(ref, st, c, m["planes_all"][pl_], float(v))
-                        for (j_, _, _, pl_, st, c), v in zip(part, p[:len(part)].tolist()) if crop_rows[j_].get("fluid") == 1]
-        dt = time.time() - t
-        timer["models"] += dt
-        timer["model " + m["name"]] = timer.get("model " + m["name"], 0.0) + dt
-    if models.emb_heads and emb_store:    # embedding heads (infer.emb_heads) on the features kept above
-        from infer import emb_heads
-        t = time.time()
-        out += emb_heads.predict(models.emb_heads, emb_store, crop_rows, dev)
-        timer["models"] += time.time() - t
-    # Hybrid models: joint crops cut once from the same caches and consensus boxes, shared by all of them.
-    if models.hybrids and len(rois):
-        t = time.time()
-        h_rows, h_crops = hybrid_crops(ser, rois, models.hybrids[0]["crop"])
-        assert all(h["crop"] == models.hybrids[0]["crop"] for h in models.hybrids), "hybrids need one crop set"
-        torch.cuda.synchronize()
-        timer["crops"] += time.time() - t
-        for h in models.hybrids if h_rows else []:
-            t = time.time()
-            out += hybrid_predict(h, h_rows, h_crops)
-            dt = time.time() - t
-            timer["models"] += dt
-            timer["model " + h["name"]] = timer.get("model " + h["name"], 0.0) + dt
-    # Study-level models (infer.study_models): every series' capsule crop of the study at once.
-    if models.studies and crop_rows:
-        from infer import study_models
-        t = time.time()
-        out += study_models.predict_chunk(models.studies, models.study_encoders, crop_rows, crops, AMP_DTYPE)
-        dt = time.time() - t
-        timer["models"] += dt
-        timer["study models"] = timer.get("study models", 0.0) + dt
-    rows = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "plane", "p"])
-    preds = rows.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
-    # Per-ROI sub-targets / auxiliary outputs ("<ROI>|fracture") -> the study finding ("Fracture"): max over ROIs.
-    from crops.train import finding_of
-    sub = preds[preds.cls.str.contains("|", regex=False)]
-    if len(sub):
-        sub = sub.assign(cls=sub.cls.str.split("|").str[1].map(finding_of)).dropna(subset=["cls"])
-        preds = pd.concat([preds, sub.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.max()], ignore_index=True)
-    for ref, base, planes in models.restricted:            # "name@planes" recipe entries
-        if planes == ["FS"]:                               # rows already added; studies without one: all series
-            have = set(preds.StudyInstanceUID[preds.model == ref])
-            fb = preds[(preds.model == base) & ~preds.StudyInstanceUID.isin(have)]
-            preds = pd.concat([preds, fb.assign(model=ref)], ignore_index=True)
-            continue
-        sub = rows[(rows.model == base) & rows.plane.isin(planes)]
-        preds = pd.concat([preds, sub.groupby(["StudyInstanceUID", "cls"], as_index=False).p.mean().assign(model=ref)],
-                          ignore_index=True)
+    if crop_rows:
+        x_all, have = torch.stack(cs), np.stack(have)
+        for m in models.crops:
+            items = [(j, roi, rid, m["planes_all"].index(s["plane"]), s["StudyInstanceUID"], c)
+                     for j, s in enumerate(crop_rows) if s["plane"] in m["planes"]
+                     for c, (roi, rid) in m["rois"].items() if have[j, roi]]
+            for i in range(0, len(items), CROP_BATCH):
+                part = items[i:i + CROP_BATCH]
+                j, roi, rid, pl = (torch.tensor(v, device=dev) for v in list(zip(*part))[:4])
+                x = _padded(x_all[j, roi], CROP_BATCH).float() / 255
+                with torch.autocast(**amp):
+                    p = torch.sigmoid(m["net"](x, _padded(rid, CROP_BATCH), _padded(pl, CROP_BATCH)).float())
+                out += [(m["name"], st, c, float(v)) for (_, _, _, _, st, c), v in zip(part, p[:len(part)].tolist())]
+    timer["models"] += time.time() - t
+    preds = pd.DataFrame(out, columns=["model", "StudyInstanceUID", "cls", "p"])
+    preds = preds.groupby(["model", "StudyInstanceUID", "cls"], as_index=False).p.mean()
     series = series.assign(p_right=[s["p_right"] for s in ser],
                            dicom_laterality=[s["dicom_laterality"] for s in ser])
     failed = pd.DataFrame([{k: s.get(k) for k in ["StudyInstanceUID", "SeriesInstanceUID", "plane", "status"]}
                            for st in studies for s in st if s["status"] != "ok"])
-    if models.shared8:                     # the shared8 ensemble on this chunk's sagittal / coronal series (infer.shared8)
-        from infer import shared8
-        t = time.time()
-        preds = pd.concat([preds, shared8.predict_chunk(studies, boxes, models.shared8, models.shared8_holder,
-                                                        models.shared8_out_dir)], ignore_index=True)
-        timer["shared8"] = timer.get("shared8", 0.0) + time.time() - t
     return pd.concat([series, failed], ignore_index=True), boxes, preds
 
 
@@ -700,8 +416,7 @@ def run_shard(df, weights, recipe, out_dir, workers):
     dev = torch.device("cuda")
     t0 = time.time()
     models = Models(weights, recipe, dev)
-    models.shared8_out_dir = out_dir
-    timer = dict.fromkeys(["load", "warmup", "wait", "prep", "side", "unet", "boxes", "consensus", "crops", "models"], 0.0)
+    timer = dict.fromkeys(["load", "warmup", "wait", "prep", "side", "unet", "consensus", "crops", "models"], 0.0)
     timer["load"] = time.time() - t0
     t = time.time()
     models.warmup()
@@ -724,8 +439,6 @@ def run_shard(df, weights, recipe, out_dir, workers):
         for s in study:
             if s["status"] == "ok":
                 try:
-                    if models.shared8 and s["plane"] in ("Sagittal", "Coronal"):     # its own renderer reads raw pixels
-                        s["_shared8_raw"], s["_shared8_unsigned"] = s["raw"], s["unsigned"]
                     s["cache"] = gpu_cache(s.pop("raw").to(dev, non_blocking=True), s.pop("unsigned"))
                     v = gpu_volume(s["cache"])
                     s["volume"] = v.flip(_lr_axis(s["plane"])) if s["conv_flip"] else v
@@ -741,81 +454,47 @@ def run_shard(df, weights, recipe, out_dir, workers):
         t = time.time()
     if chunk:
         flush()
-    if models.shared8_holder.get("worker") is not None:
-        models.shared8_holder["worker"].close()
     os.makedirs(out_dir, exist_ok=True)
     pd.concat(all_series, ignore_index=True).to_csv(os.path.join(out_dir, "series.csv"), index=False)
     pd.concat(all_boxes, ignore_index=True).to_csv(os.path.join(out_dir, "rois.csv"), index=False)
     pd.concat(all_preds, ignore_index=True).to_csv(os.path.join(out_dir, "preds.csv"), index=False)
-    total = time.time() - t0
-    print(f"shard done: {len(loader)} studies in {total:.0f}s -- " +
+    print(f"shard done: {len(loader)} studies in {time.time() - t0:.0f}s -- " +
           ", ".join(f"{k} {v:.0f}s" for k, v in timer.items()), flush=True)
 
 
-def load_recipe(path):
-    """recipe.json -> {finding: {"models": [...], "minus": {"finding": f, "beta": b} or None}}.
-
-    A model entry "name@Plane1,Plane2" uses model `name` for that finding averaged over the series of those
-    planes only (e.g. a model trained with axial crops, read without its axial series for one finding).
-    The model itself is loaded and run once; the restricted average reuses its per-series outputs."""
-    with open(path) as f:
-        r = json.load(f)
-    return {c: (dict(models=v, minus=None) if isinstance(v, list) else dict(models=v["models"], minus=v.get("minus")))
-            for c, v in r.items()}
-
-
 def combine(preds, recipe, studies):
-    """Per-model study probabilities -> one column per finding: a single model's probability,
-    or the mean of several models' ranks over the test studies; then the cross-talk
-    corrections (score - beta x another finding's combined score)."""
+    """Per-model study probabilities -> one column per finding: a single model's probability, or the mean of several
+    models' ranks over the test studies. A study missing from some models (e.g. no axial series for an axial model)
+    gets the mean of the others; NaN only if no model predicts it."""
     tab = {m: g.pivot(index="StudyInstanceUID", columns="cls", values="p") for m, g in preds.groupby("model")}
     study = pd.DataFrame(index=pd.Index(studies, name="StudyInstanceUID"))
-
-    def rank_mean(cols):
-        """Mean of the members' ranks over the studies each member predicts; a study missing from some members
-        (e.g. no axial series for an axial-only model) gets the mean of the others, NaN only if none predict it."""
-        return cols[0] if len(cols) == 1 else pd.concat([col.rank(pct=True) for col in cols], axis=1).mean(axis=1)
-
-    def member(m, c):
-        """A model's column, or a nested list's mean rank (a seed group / sub-ensemble counted as one member)."""
-        if isinstance(m, list):
-            return rank_mean([member(x, c) for x in m])
-        return tab[m][c].reindex(study.index) if m in tab and c in tab[m] else pd.Series(np.nan, index=study.index)
-
-    for c, r in recipe.items():
-        if c.startswith("_"):                                  # "_<name>": models run for the notebook only
-            continue
-        study[c] = rank_mean([member(m, c) for m in r["models"]])
-    base = study.copy()
-    for c, r in recipe.items():
-        if r["minus"]:
-            # Back to [0, 1] as percentile ranks over the test studies (same order, valid probabilities).
-            study[c] = (base[c] - r["minus"]["beta"] * base[r["minus"]["finding"]]).rank(pct=True)
+    for c, ms in recipe.items():
+        cols = [tab[m][c].reindex(study.index) if m in tab and c in tab[m] else
+                pd.Series(np.nan, index=study.index) for m in ms]
+        study[c] = cols[0] if len(cols) == 1 else pd.concat([col.rank(pct=True) for col in cols], axis=1).mean(axis=1)
     return study
 
 
 def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_series", series_csv=None,
-        limit=None, recipe_path=None, amp="fp16", half=False):
+        limit=None):
+    from infer.sanitize import sanitize
+
     t0 = time.time()
-    recipe_path = recipe_path or os.path.join(weights, "recipe.json")
-    recipe = load_recipe(recipe_path)
+    with open(os.path.join(weights, "recipe.json")) as f:
+        recipe = json.load(f)
     df = list_series(data_dir, series_dir, series_csv)
     if limit:
         df = df[df.StudyInstanceUID.isin(df.StudyInstanceUID.drop_duplicates()[:limit])]
     os.makedirs(out_dir, exist_ok=True)
-    for d in glob.glob(os.path.join(out_dir, "shard*")):    # outputs of an earlier run
-        shutil.rmtree(d)
+    for d in glob.glob(os.path.join(out_dir, "shard*")) + [os.path.join(out_dir, "dicom")]:   # an earlier run
+        shutil.rmtree(d, ignore_errors=True)
+    df = sanitize(df, os.path.join(out_dir, "dicom"), max(1, len(gpus) * workers))
     df["shard"] = df.StudyInstanceUID.map(shard_studies(df, len(gpus)))
     df.to_csv(os.path.join(out_dir, "series_list.csv"), index=False)
     shards = sorted(df["shard"].unique())                  # fewer studies than GPUs: some idle
-    procs = []
-    for i in shards:
-        g = gpus[i]
-        procs.append(subprocess.Popen(
-            [sys.executable, "-m", "infer.pipeline", "--shard", str(i),
-             "--weights", weights, "--out_dir", out_dir, "--workers", str(workers), "--recipe", recipe_path,
-             "--amp", amp] + (["--half"] if half else []),
-            env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(g))))
+    procs = [subprocess.Popen([sys.executable, "-m", "infer.pipeline", "--shard", str(i), "--weights", weights,
+                               "--out_dir", out_dir, "--workers", str(workers)],
+                              env=dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpus[i]))) for i in shards]
     if any(p.wait() for p in procs):
         raise RuntimeError("a shard failed")
     preds = pd.concat([pd.read_csv(os.path.join(out_dir, f"shard{i}", "preds.csv"), dtype={"model": str})
@@ -826,15 +505,11 @@ def run(data_dir, weights, out_dir, submission, gpus, workers, series_dir="test_
     sub = pd.DataFrame({"StudyInstanceUID": studies})
     for c in CLASSES:
         sub[c] = sub.StudyInstanceUID.map(study[c]) if c in study else np.nan
-    # Studies the recipe could not predict (no crops: e.g. no sagittal / coronal series, unreadable DICOMs): the
-    # finding's median over the other studies, a neutral value on its own scale (raw probability or mean rank);
-    # roi_study_preds.csv keeps them NaN for the notebook's per-study b1_c1 fallback. Uncovered findings: 0.5.
-    for c in CLASSES:
         n = int(sub[c].isna().sum())
-        if n and sub[c].notna().any():
+        if c in study and n and sub[c].notna().any():     # studies without a prediction: the finding's median
             print(f"  {c}: {n} studies without a prediction -> median")
             sub[c] = sub[c].fillna(sub[c].median())
-    sub[CLASSES] = sub[CLASSES].fillna(0.5)
+    sub[CLASSES] = sub[CLASSES].fillna(0.5)                                  # findings outside the recipe
     sub.to_csv(submission, index=False)
     print(f"-> {submission}: {len(sub)} studies, recipe covers {list(recipe)} (0.5 elsewhere), "
           f"{time.time() - t0:.0f}s in total")
@@ -852,24 +527,17 @@ def main():
     p.add_argument("--series_dir", default="test_series")
     p.add_argument("--series_csv", default=None, help="series list (default: walk <data_dir>/<series_dir>)")
     p.add_argument("--limit", type=int, default=None, help="first N studies (debugging)")
-    p.add_argument("--recipe", default=None, help="recipe file (default: <weights>/recipe.json)")
-    p.add_argument("--half", action="store_true", help="crop models in float16 (weights and inputs), no autocast: "
-                   "half their weight memory (efficiency pipeline); the side model and U-Net stay float32 + autocast")
-    p.add_argument("--amp", default="fp16", choices=["fp16", "bf16", "fp32"],
-                   help="hybrid models' autocast (fp16: T4; bf16: as validated); crop models are unaffected")
     p.add_argument("--shard", type=int, default=None, help=argparse.SUPPRESS)
     a = p.parse_args()
-    global AMP_DTYPE, HALF
-    AMP_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[a.amp]
-    HALF = a.half
     if a.shard is not None:               # worker process, spawned by run()
-        recipe = load_recipe(a.recipe or os.path.join(a.weights, "recipe.json"))
+        with open(os.path.join(a.weights, "recipe.json")) as f:
+            recipe = json.load(f)
         df = pd.read_csv(os.path.join(a.out_dir, "series_list.csv"))
         df = df[df["shard"] == a.shard]
         run_shard(df, a.weights, recipe, os.path.join(a.out_dir, f"shard{a.shard}"), a.workers)
         return
     run(a.data_dir, a.weights, a.out_dir, a.submission, a.gpus.split(","), a.workers, a.series_dir,
-        a.series_csv, a.limit, a.recipe, a.amp, a.half)
+        a.series_csv, a.limit)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ DEFAULTS = {
     "weight_decay": 1e-4,
     "threshold": 0.5,
     "augmentations": {
-        "mirror_p": 0.0, "affine_p": 0.8, "rot_deg": 12.0, "scale_range": (0.85, 1.15),
+        "affine_p": 0.8, "rot_deg": 12.0, "scale_range": (0.85, 1.15),
         "shift": 0.08, "intensity_p": 0.8, "gamma": 0.3, "contrast": 0.25,
         "brightness": 0.1, "noise_std": 0.02,
     },
@@ -87,12 +87,8 @@ def main():
     vols, index = load_volumes()
 
     if args.predict:
-        sd = torch.load(os.path.join(args.predict, "ckpt_final.pt"), map_location=ctx.device)
-        # Models from before an ROI class was added have fewer outputs: the first
-        # classes of ROI_CLASSES, in order.
-        n_out = sd["decoder.seg_layers.4.weight"].shape[0]
-        model = build_model(num_classes=n_out).to(ctx.device)
-        model.load_state_dict(sd)
+        model = build_model().to(ctx.device)
+        model.load_state_dict(torch.load(os.path.join(args.predict, "ckpt_final.pt"), map_location=ctx.device))
         dl, _ = loader(RoiDataset(vols, index), args, False, ctx)
         pred = predict(model, dl, index, ctx.device, args.threshold, with_labels=False)
         if ctx.is_main:

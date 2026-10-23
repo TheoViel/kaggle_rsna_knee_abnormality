@@ -1,7 +1,6 @@
 """Attention maps of the classifier, for the ROI classes, on sagittal and coronal series.
 
-    python -m roi.extract --tag v1 --runs 4 --studies gt            # one GPU
-    python -m roi.extract --tag v1 --runs 2,3,4,5 --gpus 0,1,2,3    # all studies, 4 GPUs
+    python -m roi.extract --tag ens --runs <run dir>,<run dir>,... --studies all --gpus 0,1,2,3
 
 Writes output/roi/attention/<tag>/maps/<SeriesInstanceUID>.npz with
     slices  (F,)          original slice index (output/series_npy) of each frame
@@ -35,18 +34,16 @@ import sys
 import time
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from params import CLASSES, OUTPUT_FOLDER
+from params import CACHE_MAX_SLICES, CLASSES, OUTPUT_FOLDER
 
 # One ROI per class in every series: the 7 ligament / meniscus / compartment
 # findings, and Baker's -- a cyst is by definition in the popliteal fossa.
 ROI_CLASSES = CLASSES[:7] + ["Baker's"]
 ROI_IDX = [CLASSES.index(c) for c in ROI_CLASSES]
 ROI_PLANES = ("Sagittal", "Coronal")
-RUNS_DIR = "../logs/cls_run/2026-10-08/"
 ATTN_DIR = os.path.join(OUTPUT_FOLDER, "roi", "attention")
 # Quarter of the stride-8 attention cell, in model-input pixels.
 SHIFT = 2
@@ -56,7 +53,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tag", required=True)
-    p.add_argument("--runs", default="4", help="comma-separated run ids under logs/cls_run/2026-10-08/")
+    p.add_argument("--runs", required=True, help="comma-separated classifier run folders (main_cls.py)")
     p.add_argument("--shift_tta", type=lambda s: s.lower() != "false", default=True)
     p.add_argument("--grid", type=int, default=72)
     p.add_argument("--studies", default="gt", help="gt | all | comma-separated StudyInstanceUIDs")
@@ -64,6 +61,13 @@ def parse_args():
     p.add_argument("--worker", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--n_workers", type=int, default=1, help=argparse.SUPPRESS)
     return p.parse_args()
+
+
+def cache_to_original_slices(n_orig):
+    """Original slice index of each slice of the cache (`prepare_cache.py` keeps at most CACHE_MAX_SLICES)."""
+    if n_orig <= CACHE_MAX_SLICES:
+        return np.arange(n_orig)
+    return np.round(np.linspace(0, n_orig - 1, CACHE_MAX_SLICES)).astype(int)
 
 
 def shift(x, dy, dx, fill):
@@ -76,11 +80,11 @@ def shift(x, dy, dx, fill):
 
 
 class Extractor:
-    def __init__(self, run_ids, shift_tta, grid, device="cuda"):
-        from main_attention import load_run
+    def __init__(self, run_dirs, shift_tta, grid, device="cuda"):
+        from knee_cls.main import load_run
 
         self.device = torch.device(device)
-        self.models = [load_run(os.path.join(RUNS_DIR, str(r)), self.device) for r in run_ids]
+        self.models = [load_run(d, self.device) for d in run_dirs]
         self.shift_tta = shift_tta
         self.grid = grid
 
@@ -118,7 +122,6 @@ class Extractor:
     def study(self, studies, series, uid):
         """-> list of per-series dicts (see module doc) for one study."""
         from knee_cls.data import KneeStudyDataset, collate_studies, to_device
-        from main_attention import cache_to_original_slices
 
         sel = series[(series.StudyInstanceUID == uid) & series.Anatomical_Plane.isin(ROI_PLANES)]
         if sel.empty:

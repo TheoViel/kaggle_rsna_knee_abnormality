@@ -2,7 +2,7 @@
 Distributed helpers for single-process and torchrun/DDP training.
 
 A process group is only created when torchrun sets WORLD_SIZE > 1, so the same
-code path runs unchanged in notebooks and in single-GPU scripts.
+code path runs unchanged in single-GPU scripts.
 """
 
 import os

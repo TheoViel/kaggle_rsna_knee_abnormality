@@ -61,18 +61,6 @@ def make_splits(studies, holdout_frac=0.1, seed=0):
     return rest[n_hold:].tolist(), gt, rest[:n_hold].tolist()
 
 
-def make_folds(studies, n_folds, seed=42):
-    """StudyInstanceUID -> fold (0 .. n_folds - 1) over every training study, for out-of-fold predictions
-    (pseudo-labels). The 58 radiologist studies and the rest are spread over the folds separately."""
-    rng = np.random.default_rng(seed)
-    out = {}
-    for part in (studies.is_gt, ~studies.is_gt):
-        ids = np.sort(studies.loc[part, "StudyInstanceUID"].to_numpy())
-        ids = ids[rng.permutation(len(ids))]
-        out.update({s: i % n_folds for i, s in enumerate(ids)})
-    return out
-
-
 def series_meta_vector(plane, fluid, fat):
     v = np.zeros(len(PLANES) + 4, dtype=np.float32)
     v[PLANES.index(plane)] = 1

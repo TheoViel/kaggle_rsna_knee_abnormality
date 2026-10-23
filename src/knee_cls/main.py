@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from types import SimpleNamespace
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -51,6 +53,16 @@ def build_model(args, ctx, pretrained=None):
     return model
 
 
+def load_run(run_dir, device):
+    """A trained run (args.json + ckpt_final.pt) -> (model in eval mode, its args)."""
+    with open(os.path.join(run_dir, "args.json")) as f:
+        args = SimpleNamespace(**json.load(f))
+    ctx = SimpleNamespace(is_main=True, distributed=False, device=device)
+    model = build_model(args, ctx, pretrained=False)
+    model.load_state_dict(torch.load(os.path.join(run_dir, "ckpt_final.pt"), map_location=device))
+    return model.eval(), args
+
+
 def run(args, ctx):
     studies, series = load_tables()
     train_ids, gt_ids, hold_ids = make_splits(
@@ -72,6 +84,6 @@ def run(args, ctx):
     del model
     torch.cuda.empty_cache()
     if ctx.is_main and metrics:
-        print(f"\nFINAL  " + "  ".join(f"{k} {v:.4f}" for k, v in metrics.items()
+        print("\nFINAL  " + "  ".join(f"{k} {v:.4f}" for k, v in metrics.items()
                                       if isinstance(v, float)))
     return metrics
