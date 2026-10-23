@@ -2,6 +2,7 @@
 
     python -m crops.prepare --boxes round3_pred --name r3
     python -m crops.prepare --boxes round3_axial --name r3_axial --volumes volumes_axial
+    python -m crops.prepare --boxes ../data/rois.csv.gz --name r3    # the repository's boxes (round 3, all planes)
 
 For every sagittal and coronal series and every ROI (`roi.extract.ROI_CLASSES`),
 from the series' 384 px uint8 cache (`prepare_cache.py`):
@@ -15,7 +16,7 @@ from the series' 384 px uint8 cache (`prepare_cache.py`):
     are mirrored along the left-right axis -- the slice order for sagittal, the
     columns for coronal -- so every crop is seen as a right knee.
 
-Boxes come from the ROI U-Net's predictions (`--boxes`, output/roi/labels/<name>.csv),
+Boxes come from the ROI U-Net's predictions (`--boxes`, output/roi/labels/<name>.csv, or a file path),
 which is also what inference produces, so training and test crops match.
 
 Output: output/crops/<name>.npy (N, K, DEPTH, SIZE, SIZE) uint8, memory-mappable,
@@ -104,7 +105,7 @@ def main():
     a = p.parse_args()
     os.makedirs(CROP_DIR, exist_ok=True)
     vols = pd.read_csv(os.path.join(OUTPUT_FOLDER, "roi", f"{a.volumes}.csv"))
-    pred = pd.read_csv(os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
+    pred = pd.read_csv(a.boxes if os.path.isfile(a.boxes) else os.path.join(LABEL_DIR, f"{a.boxes}.csv"))
     pred = pred[pred.z0.notna()]
     boxes = {}
     for r in pred.to_dict("records"):

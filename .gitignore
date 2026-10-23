@@ -35,3 +35,5 @@ weights_val/
 *.pt
 *.pkl
 *.npy
+# Files kept in the repository
+!/data/**

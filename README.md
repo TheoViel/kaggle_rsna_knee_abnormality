@@ -47,9 +47,7 @@ These are validation versions of the models: the submitted ones are fullfits tha
 
 Environment: `uv sync` (Python 3.12; `pyproject.toml` lists only what `src/` and the notebook import, plus the DICOM decoders).
 
-From `src/`, with 4 GPUs and in `input/`:
-- the competition data: `train.csv`, `train_series.csv`, `train_series/`;
-- the report labels: `full_claude_context_v2_labels.csv`, `codex-labels_final_52.csv`, `codex-labels_final_4349.csv`.
+From `src/`, with 4 GPUs and the competition data in `input/` (`train.csv`, `train_series.csv`, `train_series/`). The report labels are read from `data/labels/`.
 
 ```bash
 bash reproduce.sh                  # data side cls roi crops teachers students package
@@ -59,6 +57,19 @@ bash reproduce.sh teachers         # or any stage on its own, once the earlier o
 - Every run logs to `logs/repro/<name>/<date>/<id>/`.
 - The weights land in `output/weights_1/`, with the same layout as `rsna-knee-weights-1`.
 - Start from an empty `output/`: some steps skip outputs that already exist (e.g. the attention maps).
+
+**Skipping the ROI stages.** To retrain only the crop models, the original sides and boxes in `data/` replace the `side`, `cls` and `roi` stages:
+
+```bash
+bash reproduce.sh data
+cp ../data/series_laterality.csv ../output/
+python -m crops.prepare --boxes ../data/rois.csv.gz --name r3
+python -m crops.prepare --boxes ../data/rois.csv.gz --name r3_axial --volumes volumes_axial
+bash reproduce.sh teachers students    # or, without the teachers:
+                                       # cp ../data/labels/pl_round2.csv ../output/crops/ && bash reproduce.sh students
+```
+
+The `package` stage then needs the side and U-Net runs; for inference, take `side/` and `roi/` from `rsna-knee-weights-1`.
 
 **Differences from the original runs:**
 - **Side classifier labels:** the DICOM tag only. Originally, untagged studies also took the side inferred from the round-1 U-Net boxes.
@@ -71,6 +82,17 @@ Reproduced exactly from the original intermediate files:
 - the round-0, round-3, MCL-prior and Baker's labels;
 - the `r3` training crops;
 - `pl_round1` / `pl_round2` from the teachers' predictions.
+
+## Data in the repository
+
+| File | Content |
+|---|---|
+| `data/labels/full_claude_context_v2_labels.csv` | Claude soft labels from the reports, 12 findings, all 4,407 studies |
+| `data/labels/codex-labels_final_52.csv`, `codex-labels_final_4349.csv` | Codex soft labels from the reports: 52 of the 58 radiologist studies + the 4,349 others |
+| `data/labels/pl_round1.csv` | Pseudo-labels: per study and ROI finding, the mean of the 5 teachers |
+| `data/labels/pl_round2.csv` | The crop models' targets: 0.5 × `pl_round1` + 0.5 × the mean of the Claude and Codex labels (NaN for the 6 radiologist studies without Codex labels) |
+| `data/series_laterality.csv` | Every training series: plane, DICOM Laterality tag, side classifier P(right) and side (`side_model`, the side used everywhere) |
+| `data/rois.csv.gz` | Round-3 ROI boxes of every training series: U-Net boxes on sagittal / coronal series (`source` unet), registered boxes on axial ones (`source` registered). Original voxel indices (`z0`..`x1`, inclusive; slices in the order of `prepare_data.py`) and the box confidence |
 
 ## Inference
 
@@ -93,4 +115,5 @@ src/
   infer/                                         inference
   reproduce.sh                                   all training stages
 notebooks/inference.ipynb                        Kaggle inference
+data/                                            labels, knee sides, ROI boxes of the training set
 ```

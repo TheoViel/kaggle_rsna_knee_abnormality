@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler  # noqa: E402
 
 from crops.train import GROUPS, CropDataset, Crop25D, fit, load_crops  # noqa: E402
 from knee_cls.data import load_tables, make_splits  # noqa: E402
-from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
+from params import LABELS_FOLDER, LOG_FOLDER, OUTPUT_FOLDER  # noqa: E402
 from training.distributed import (broadcast_object, cleanup_distributed, init_distributed,  # noqa: E402
                                   seed_everything, worker_init_fn)
 from utils.logger import create_logger, prepare_log_folder  # noqa: E402
@@ -41,7 +41,7 @@ DEFAULTS = {
 def training_targets(which, studies, classes):
     """Soft training labels per finding: Claude report labels, Codex ones, their mean, or pseudo-labels (`pl:<name>`).
 
-    Codex covers every non-radiologist study (input/codex-labels_final_4349.csv)
+    Codex covers every non-radiologist study (data/labels/codex-labels_final_4349.csv)
     and 52 of the 58 radiologist ones; those are validation-only, so training is
     unaffected. Validation keeps scoring against the Claude labels (`hold`) so
     that runs stay comparable.
@@ -53,7 +53,7 @@ def training_targets(which, studies, classes):
         return {c: pl[c] for c in classes}
     if which == "claude":
         return {c: claude[f"target_{c}"] for c in classes}
-    codex = pd.concat([pd.read_csv(f"{INPUT_FOLDER}codex-labels_final_{n}.csv") for n in (52, 4349)])
+    codex = pd.concat([pd.read_csv(f"{LABELS_FOLDER}codex-labels_final_{n}.csv") for n in (52, 4349)])
     codex = codex.set_index("StudyInstanceUID")
     if which == "codex":
         return {c: codex[c] for c in classes}

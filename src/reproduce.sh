@@ -5,8 +5,8 @@
 #   bash reproduce.sh roi crops  # some stages (each needs the outputs of the previous ones)
 #
 # Stages: data, side, cls, roi, crops, teachers, students, package. Each run logs to ../logs/repro/<name>/<date>/<id>/;
-# a later stage takes the latest run of that name. Needs input/ (train.csv, train_series.csv, train_series/, the Claude
-# and Codex report labels) and 4 GPUs (NGPU to change). See README.md for what each stage does.
+# a later stage takes the latest run of that name. Needs input/ (train.csv, train_series.csv, train_series/), the report
+# labels in data/labels/ and 4 GPUs (NGPU to change). See README.md for what each stage does.
 set -e
 cd "$(dirname "$0")"
 NGPU=${NGPU:-4}
