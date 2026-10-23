@@ -75,6 +75,20 @@ def to_monochrome2(vol, dss):
     return out
 
 
+def pixel_spacing(ds):
+    """(row, column) spacing in mm: PixelSpacing, else ImagerPixelSpacing, else square pixels over a 160 mm field of view
+    on the longer side (the training median in every plane). Spacing only scales the world geometry the cross-plane box transfer uses, so a missing tag
+    must not drop the series."""
+    for tag in ("PixelSpacing", "ImagerPixelSpacing"):
+        try:
+            v = [float(x) for x in ds.get(tag)]
+            if len(v) == 2 and all(np.isfinite(v)) and min(v) > 0:
+                return v
+        except Exception:  # noqa: BLE001 -- absent / malformed
+            pass
+    return [160.0 / max(int(ds.Rows), int(ds.Columns))] * 2
+
+
 def read_series(folder):
     import pydicom
 
@@ -108,7 +122,7 @@ def process(job):
         plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
         geom = geometry_from_slices([d.ImageOrientationPatient for d in dss],
                                     [d.ImagePositionPatient for d in dss],
-                                    dss[0].PixelSpacing, dss[0].get("SliceThickness"))
+                                    pixel_spacing(dss[0]), dss[0].get("SliceThickness"))
         cache = preprocess_volume(vol)
         if cache_dir:
             # The 384 px cache the ROI crops are cut from (stored orientation, before any flip).

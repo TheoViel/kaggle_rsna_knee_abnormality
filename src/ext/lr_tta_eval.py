@@ -62,6 +62,8 @@ def main():
         model = model.to(device).eval()
         plain, mir = run_passes(model, ds, a, device)
         sp, sm, sb = study_scores(ds.items, plain), study_scores(ds.items, mir), study_scores(ds.items, (plain + mir) / 2)
+        sp.rename_axis("StudyInstanceUID").to_csv(R + run + "/val_study_preds_plain.csv")      # recipe-level scoring
+        sb.rename_axis("StudyInstanceUID").to_csv(R + run + "/val_study_preds_lrtta.csv")
         for F in sp.columns:
             if f"gt_{F}" not in S:
                 continue

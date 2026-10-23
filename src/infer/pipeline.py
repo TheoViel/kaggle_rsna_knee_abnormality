@@ -118,7 +118,7 @@ def read_series(folder, plane):
     """
     import pydicom
 
-    from infer.prep import slice_order, to_monochrome2
+    from infer.prep import pixel_spacing, slice_order, to_monochrome2
     from knee_registration import geometry_from_slices
 
     files = sorted(glob.glob(os.path.join(folder, "*.dcm")))
@@ -139,7 +139,7 @@ def read_series(folder, plane):
     vol = to_monochrome2(vol, [dss[i] for i in kept])        # MONOCHROME1 slices inverted
     plane = plane if isinstance(plane, str) and plane else (major or "Sagittal")
     geom = geometry_from_slices([d.ImageOrientationPatient for d in dss], [d.ImagePositionPatient for d in dss],
-                                dss[0].PixelSpacing, dss[0].get("SliceThickness"))
+                                pixel_spacing(dss[0]), dss[0].get("SliceThickness"))
     d = np.array(geom["direction"]).reshape(3, 3)
     # Training convention: sagittal slices towards patient right (-x), columns towards left (+x).
     conv_flip = bool(d[0, 2] > 0) if plane == "Sagittal" else bool(d[0, 0] < 0)

@@ -51,7 +51,10 @@ DEFAULTS = {
     "pairwise": 0.0,
     # Series-level targets (pl.series_labels): CSV SeriesInstanceUID, cls, factor; positive training items (target >= 0.5)
     # take target x factor, so series where the finding does not show get a lower target. "" = study label everywhere.
-    "series_labels": "",                      # weight of the pairwise AUC loss (crops.train.pairwise_auc_loss), 1 - it for BCE
+    "series_labels": "",
+    # Probability of mirroring a medial / lateral meniscus or OA training crop left-right and presenting it as the other
+    # compartment, with its own label (crops.train.CropDataset); 0 = off. Groups without both partners: no effect.
+    "lr_swap": 0.0,                      # weight of the pairwise AUC loss (crops.train.pairwise_auc_loss), 1 - it for BCE
     # Multiple-instance meniscus bags (crops.train.PairDataset): series of a crop set whose exam has a tear
     # of unknown side (--mil_labels csv, StudyInstanceUID + --mil_col == 1); loss on max(medial, lateral).
     "mil_crops": "", "mil_labels": "", "mil_col": "mrnet_meniscus", "mil_weight": 1.0, "mil_bs": 4,
@@ -224,6 +227,15 @@ def main():
         if ctx.is_main:
             print(f"- series labels {args.series_labels}: {int(m.sum())} positive items rescaled "
                   f"(mean factor {f[m].mean():.3f}); {int((it.target >= 0.5).sum())} items still >= 0.5")
+    if args.lr_swap:
+        pairs = [("Medial Meniscus", "Lateral Meniscus"), ("Medial OA", "Lateral OA")]
+        part = {}
+        for a_, b_ in pairs:
+            if a_ in classes and b_ in classes:
+                part[classes.index(a_)], part[classes.index(b_)] = classes.index(b_), classes.index(a_)
+        train_ds.lr_swap, train_ds.partner = args.lr_swap, part
+        if ctx.is_main:
+            print(f"- lr_swap {args.lr_swap}: partners {{{', '.join(f'{classes[k]} -> {classes[v]}' for k, v in part.items())}}}")
     # Validation is scored from the study tables, not these targets: Claude ones keep all 58 studies in.
     val_t = training_targets("claude", studies, classes)
     for c in classes:                     # "<ROI>|fracture": scored at study level (crops.train.study_auc)

@@ -127,10 +127,19 @@ class CropDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    lr_swap, partner = 0.0, {}          # training only (main_crops --lr_swap): see __getitem__
+
     def __getitem__(self, i):
         r = self.items.iloc[i]
-        return {"x": torch.from_numpy(np.array(self.crops[r.src][r.row, r.roi])),   # D S S uint8
-                "roi": torch.tensor(r.rid), "plane": torch.tensor(PLANES.index(r.Anatomical_Plane)),
+        x, rid = np.array(self.crops[r.src][r.row, r.roi]), r.rid
+        if self.lr_swap and rid in self.partner and np.random.rand() < self.lr_swap:
+            # Left-right mirror of a medial / lateral compartment crop, presented as the other compartment with its own
+            # label (a mirrored lateral meniscus looks like a medial one in the canonical right-knee frame).
+            # Sagittal: the left-right axis is the slice axis (reverse the frames); coronal / axial: the columns.
+            x = x[::-1] if r.Anatomical_Plane == "Sagittal" else x[:, :, ::-1]
+            x, rid = np.ascontiguousarray(x), self.partner[rid]
+        return {"x": torch.from_numpy(x),   # D S S uint8
+                "roi": torch.tensor(rid), "plane": torch.tensor(PLANES.index(r.Anatomical_Plane)),
                 "y": torch.tensor(float(r.target), dtype=torch.float32), "idx": torch.tensor(i),
                 "w": torch.tensor(float(r.w), dtype=torch.float32),
                 "y2": torch.tensor(float(r.target2), dtype=torch.float32)}
