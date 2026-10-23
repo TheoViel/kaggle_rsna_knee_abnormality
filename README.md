@@ -14,6 +14,10 @@ These are validation versions of the models: the submitted ones are fullfits tha
 
 ## Pipeline
 
+![Pipeline: MRI study, side classifier, ROI U-Net, ROI crops, 2.5D classifiers](assets/pipeline.png)
+
+*A left knee from the training set. Its coronal series is mirrored to a right knee, the U-Net puts one box per ROI on every sagittal and coronal series, and each ROI's 12-slice crop goes through the 2.5D classifiers.*
+
 1. **Data.** DICOM to raw arrays sorted along the slice normal (`prepare_data.py`). Then a uint8 cache: per-series percentile normalisation, padded square, 384 px, at most 64 slices (`prepare_cache.py`).
 2. **Knee side** (`side_cls.py`, `main_side.py`). A small 3D CNN predicts left or right for every series, since a study can hold both knees. It is trained on the DICOM Laterality tag, which is wrong on about 1–2% of tagged series; the model's prediction is the side used everywhere after this step.
 3. **Classifier with attention** (`main_cls.py`, `knee_cls/`). A 2.5D ConvNeXt on whole series, for the 12 findings, trained on the Claude report labels.
