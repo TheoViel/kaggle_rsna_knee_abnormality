@@ -1,16 +1,28 @@
-# RSNA Knee Abnormality Detection: rsna-knee-weights-1
+# RSNA Knee Abnormality Detection - ROI-based Pipeline
 
-Twelve findings per knee MRI study, scored by macro AUC. This branch holds the code behind `rsna-knee-weights-1`, which predicts the 8 findings that have an anatomical region:
-- ACL, MCL;
-- medial and lateral meniscus;
-- medial, lateral and patellofemoral OA;
-- Baker's cyst.
+**Author:** Theo Viel
 
-| AUC on the 58 radiologist-labelled studies | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | **Macro** |
-|---|---|---|---|---|---|---|---|---|---|
-| rsna-knee-weights-1 | 0.972 | 0.994 | 0.975 | 0.921 | 0.974 | 0.872 | 0.896 | 0.986 | **0.949** |
+This repo contains a simplified version of the ROI-based pipeline used in the Kaggle RSNA Knee Abnormality Detection competition.
+It handles 8 of the 12 classes of the challenge, and can be extended to other classes although it is slightly less competitive on these findings.
 
-These are validation versions of the models: the submitted ones are fullfits that also train on these 58 studies. On the leaderboard, with the other 4 findings from another model, the submission scored 0.962. Alone, this pipeline leaves those 4 at 0.5.
+## Competition Overview
+
+The [RSNA Knee Abnormality Detection](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) challenge asks for the probability of 12 findings per knee MRI study, scored by the macro AUC over the 12. A study holds 3 to 14 DICOM series (sagittal, coronal and axial; T1, PD or T2, with or without fat suppression) from a mix of international sites, scanners and protocols. Submissions are Kaggle notebooks without internet access, run on about 1,300 test studies.
+
+| Group | Findings |
+|---|---|
+| Ligaments | ACL, MCL |
+| Menisci | Medial meniscus, lateral meniscus |
+| Osteoarthritis | Medial, lateral and patellofemoral (PF) compartments |
+| Joint | Effusion, synovitis, Baker's cyst |
+| Bone | Contusion, fracture |
+
+**Labels are the main difficulty:**
+- **Only 58 of the 4,407 training studies have radiologist labels.** All the others come with their radiology report only: free text, in several languages, absent at test time.
+- **The report labels are noisy.** Here they were extracted by LLMs (Claude, Codex) as soft labels. Against the 58 radiologist labels, Claude's labels score 0.911 macro AUC and the mean of both sets 0.921 (on the 52 studies Codex covers): that is about the ceiling of a model trained on them. The two sets disagree most on what counts as positive, e.g. Codex calls 31% of the studies a Baker's cyst, Claude 13%.
+- **The 58 studies are too few to select models on.** With 9 to 35 positives per finding, one finding's AUC moves by several points between equivalent models. A 10% holdout of report-labelled studies serves for model selection instead.
+- **No localisation is provided.** Every finding sits in a specific structure (a ligament, a meniscus, a compartment), but there are no boxes or masks, and the knee side is not always tagged. This pipeline learns both: the ROIs from the classifier's attention, the side from the DICOM tags.
+
 
 ## Pipeline
 
@@ -46,6 +58,20 @@ These are validation versions of the models: the submitted ones are fullfits tha
    - **Pseudo-labels:** per finding, the mean of its 5 best teachers on every study (`pl_round1`). The training targets are 0.5 × that + 0.5 × the mean of the Claude and Codex labels (`pl_round2`, `crops/pseudo_labels.py`).
    - **Students:** the 7 submission models, fullfits on `pl_round2`, where the 58 radiologist studies keep their own labels.
 7. **Recipe** (`recipe.json`). Per finding, the mean rank over the test studies of its models.
+
+
+Twelve findings per knee MRI study, scored by macro AUC. This branch holds the code behind `rsna-knee-weights-1`, which predicts the 8 findings that have an anatomical region:
+- ACL, MCL;
+- medial and lateral meniscus;
+- medial, lateral and patellofemoral OA;
+- Baker's cyst.
+
+| AUC on the 58 radiologist-labelled studies | ACL | MCL | Med. men. | Lat. men. | Med. OA | Lat. OA | PF OA | Baker's | **Macro** |
+|---|---|---|---|---|---|---|---|---|---|
+| rsna-knee-weights-1 | 0.972 | 0.994 | 0.975 | 0.921 | 0.974 | 0.872 | 0.896 | 0.986 | **0.949** |
+
+These are validation versions of the models: the submitted ones are fullfits that also train on these 58 studies.
+On the leaderboard, with the other 4 findings from another model, the submission scored 0.962 public / 0.951 private.
 
 ## Reproducing the weights
 
