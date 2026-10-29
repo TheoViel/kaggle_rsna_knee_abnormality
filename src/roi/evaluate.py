@@ -19,7 +19,6 @@ default, the same series for every file, so rounds compare directly.
 import argparse
 import os
 
-import numpy as np
 import pandas as pd
 
 from roi.consensus import add_confidence

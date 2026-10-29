@@ -1,6 +1,6 @@
 """Study-level predictions of trained crop models on every study, run from src/.
 
-    python -m crops.predict --runs 6,7,10 --gpus 0,1,2,3
+    python -m crops.predict --runs <run dir>,<run dir>,... --gpus 0,1,2,3
 
 For each run: the model is rebuilt from its args.json, its checkpoint loaded, and
 every series of its planes (all studies, training and validation) predicted for
@@ -20,29 +20,23 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-
-RUNS_DIR = "../logs/crops_run/2026-10-09/"
 
 
 @torch.no_grad()
-def predict_run(run, device, crop_set=""):
-    from crops.train import GROUPS, CropDataset, build_model, load_crops
+def predict_run(d, device):
+    from crops.train import GROUPS, CropDataset, Crop25D, load_crops
 
-    d = os.path.join(RUNS_DIR, run)
     a = json.load(open(os.path.join(d, "args.json")))
     classes = GROUPS[a["group"]]
-    crops, info = load_crops(crop_set or a.get("crops", "r3"))
+    crops, info = load_crops(a.get("crops", "r3"))
     info = info[info.Anatomical_Plane.isin(a["planes"].split(","))]
     dummy = {c: pd.Series(0.0, index=info.StudyInstanceUID.unique()) for c in classes}
     ds = CropDataset(crops, info, classes, dummy)
     sd = torch.load(os.path.join(d, "ckpt_final.pt"), map_location="cpu")
-    model = build_model(a, len(classes))
-    # Runs from before axial crops existed have a 2-plane embedding (sagittal, coronal).
-    n_planes = sd["plane_embed.weight"].shape[0]
-    if n_planes != model.plane_embed.num_embeddings:
-        model.plane_embed = nn.Embedding(n_planes, model.plane_embed.embedding_dim)
+    model = Crop25D(a["backbone"], len(classes), pretrained=False, img_size=a.get("img_size") or None,
+                    hidden=a.get("hidden", 256), dropout=a.get("dropout", 0.2), drop_path=0.0,
+                    head=a.get("head", "lstm"))
     model.load_state_dict(sd)
     model = model.to(device).eval()
     dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=8, pin_memory=True)
@@ -53,11 +47,8 @@ def predict_run(run, device, crop_set=""):
             ps.append(torch.sigmoid(model(x, b["roi"].to(device), b["plane"].to(device)).float()).cpu().numpy())
     it = ds.items.assign(p=np.concatenate(ps))
     tab = it.groupby(["StudyInstanceUID", "cls"]).p.mean().unstack()
-    tab.to_csv(os.path.join(d, f"{crop_set}_study_preds.csv" if crop_set else "all_study_preds.csv"))
-    if crop_set and "SeriesInstanceUID" in it:          # per series too (e.g. fluid-sensitive aggregation)
-        it[["StudyInstanceUID", "SeriesInstanceUID", "cls", "p"]].to_csv(os.path.join(d, f"{crop_set}_series_preds.csv"),
-                                                                       index=False)
-    print(f"run {run}: {tab.shape[0]} studies x {list(tab.columns)}", flush=True)
+    tab.to_csv(os.path.join(d, "all_study_preds.csv"))
+    print(f"{d}: {tab.shape[0]} studies x {list(tab.columns)}", flush=True)
 
 
 def main():
@@ -65,19 +56,18 @@ def main():
     p.add_argument("--runs", required=True)
     p.add_argument("--gpus", default="0")
     p.add_argument("--worker", type=int, default=None)
-    p.add_argument("--crops", default="", help="crop set(s) to predict instead of the run's own (e.g. external data)")
     a = p.parse_args()
     runs = a.runs.split(",")
     gpus = a.gpus.split(",")
     if a.worker is None and len(gpus) > 1:
         procs = [subprocess.Popen([sys.executable, "-m", "crops.predict", "--runs", ",".join(runs[i::len(gpus)]),
-                                   "--gpus", g, "--worker", str(i)] + (["--crops", a.crops] if a.crops else []), env=dict(os.environ, CUDA_VISIBLE_DEVICES=g))
+                                   "--gpus", g, "--worker", str(i)], env=dict(os.environ, CUDA_VISIBLE_DEVICES=g))
                  for i, g in enumerate(gpus) if runs[i::len(gpus)]]
         sys.exit(max(p.wait() for p in procs))
     if len(gpus) == 1 and a.worker is None:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpus[0])
     for r in runs:
-        predict_run(r, torch.device("cuda"), a.crops)
+        predict_run(r, torch.device("cuda"))
 
 
 if __name__ == "__main__":

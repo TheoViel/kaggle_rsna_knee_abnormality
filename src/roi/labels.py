@@ -1,8 +1,9 @@
 """Box labels for the ROI U-Net: round 0 from attention, later rounds merged with
 the U-Net's own predictions. Run from src/.
 
-    python -m roi.labels attention --tag ens --out round0
+    python -m roi.labels attention --tag ens --out round0 --drop_classes "Baker's"
     python -m roi.labels merge --prev round0 --pred round0_pred --out round1
+    python -m roi.labels bakers --tag ens --pred round1_pred --out bakers0
 
 Round 0 (`attention`):
   - a candidate box per (series, class) from the attention maps of `roi.extract`
@@ -46,7 +47,7 @@ def _candidates(path):
     rows, cols = int(d["rows"]), int(d["cols"])
     out = []
     for k, c in enumerate(ROI_CLASSES):
-        b = grid_box(d["xy"][k], d["z"][k], mode="zrun")
+        b = grid_box(d["xy"][k], d["z"][k])
         out.append(dict(SeriesInstanceUID=uid, **{"class": c}, purity=b["purity"],
                         z_peak=float(d["z"][k].max() * len(d["z"][k])),
                         **localisation(b, len(d["z"][k]), grid, rows, cols),
@@ -88,8 +89,9 @@ def drop_disagreeing(boxes):
     return boxes[keep]
 
 
-def round0(tag, max_area, max_z_frac):
+def round0(tag, max_area, max_z_frac, drop_classes=()):
     cand = attention_candidates(tag)
+    cand = cand[~cand["class"].isin(drop_classes)]
     loc = cand[(cand.area <= max_area) & (cand.z_frac <= max_z_frac)]
     kept = drop_disagreeing(loc)
     print(f"localised {len(loc)} of {len(cand)}, kept after cross-view check {len(kept)} "
@@ -215,6 +217,7 @@ def main():
     a0.add_argument("--out", default="round0")
     a0.add_argument("--max_area", type=float, default=0.08)
     a0.add_argument("--max_z_frac", type=float, default=0.5)
+    a0.add_argument("--drop_classes", default="", help="comma-separated classes left unlabelled")
     m = sub.add_parser("merge")
     m.add_argument("--prev", required=True)
     m.add_argument("--pred", required=True)
@@ -224,7 +227,7 @@ def main():
     m.add_argument("--min_iou", type=float, default=0.3)
     m.add_argument("--drop_classes", default="", help="comma-separated classes to remove from prev and pred")
     bk = sub.add_parser("bakers")
-    bk.add_argument("--tag", default="ens8")
+    bk.add_argument("--tag", default="ens")
     bk.add_argument("--pred", default="round1_pred")
     bk.add_argument("--out", default="bakers0")
     bk.add_argument("--max_area", type=float, default=0.08)
@@ -235,7 +238,7 @@ def main():
     os.makedirs(LABEL_DIR, exist_ok=True)
     n_series = len(pd.read_csv(os.path.join(OUTPUT_FOLDER, "roi", "volumes.csv")))
     if a.cmd == "attention":
-        labels = round0(a.tag, a.max_area, a.max_z_frac)
+        labels = round0(a.tag, a.max_area, a.max_z_frac, [c for c in a.drop_classes.split(",") if c])
     elif a.cmd == "bakers":
         pred = pd.read_csv(os.path.join(LABEL_DIR, f"{a.pred}.csv"))
         labels = bakers_labels(a.tag, pred, a.max_area, a.max_z_frac, a.margin)

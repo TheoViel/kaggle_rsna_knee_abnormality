@@ -9,7 +9,7 @@ additionally holds out report-labelled studies for a steadier comparison
 between runs; set it to 0 for the final fit.
 
 See `knee_cls/model.py` for the architecture and how its attention maps become
-per-class 3D localisations, and `main_attention.py` to export them.
+per-class 3D localisations, and `roi/extract.py` to export them.
 """
 
 import argparse

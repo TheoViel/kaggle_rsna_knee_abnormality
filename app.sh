@@ -1,1 +1,0 @@
-.venv/bin/streamlit run segmentation_viewer.py

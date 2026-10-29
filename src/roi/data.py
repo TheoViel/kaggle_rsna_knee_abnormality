@@ -110,25 +110,17 @@ class RoiDataset(Dataset):
                 "row": torch.tensor(row)}
 
 
-def gpu_augment(image, target, sagittal, aug):
+def gpu_augment(image, target, aug):
     """Same random transform on image and target, per sample, on the GPU.
 
     image (N, 1, D, S, S) float in [0, 1], target (N, K, D, S, S) float.
-      - left-right mirror (`mirror_p`, 0 by default): reverse the slices of a
-        sagittal series, the columns of a coronal one. Off now that volumes are
-        in canonical (right-knee) orientation: mirroring would undo it;
+    No left-right mirroring: volumes are in canonical (right-knee) orientation.
       - in-plane affine (rotation, isotropic scale, shift), the same on every
         slice of a volume;
       - intensity: gamma, contrast, brightness, noise.
     """
     n = image.shape[0]
     dev = image.device
-    flip = torch.rand(n, device=dev) < aug["mirror_p"]
-    for i in torch.nonzero(flip).flatten().tolist():
-        # Per-sample tensors are (C, D, y, x): slices for sagittal, columns for coronal.
-        dim = 1 if bool(sagittal[i]) else 3
-        image[i] = image[i].flip(dim)
-        target[i] = target[i].flip(dim)
 
     def u(lo, hi):
         return torch.empty(n, device=dev).uniform_(lo, hi)

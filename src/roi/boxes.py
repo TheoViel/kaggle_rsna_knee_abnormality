@@ -1,16 +1,10 @@
 """Boxes from 3D maps (attention or U-Net output) and how much two views agree on them.
 
 A map here is a (F, G, G) volume over the frames of a series, in-plane on the
-slice zero-padded to a centred square, as written by `roi.extract`. Two ways to
-turn it into a box:
-
-  - "zrun": the contiguous frames around the peak of the z weights (>= z_rel x
-    peak), their in-plane maps averaged; in-plane, the main connected component
-    of the smallest region holding `mass` of the attention. What
-    `attention_boxes.py` did.
-  - "cc3d": the 3D attention itself (z weight x in-plane map); the smallest set of
-    voxels holding `mass` of it, and its 26-connected component with the most
-    attention. One box in 3D directly, no separate z and xy decisions.
+slice zero-padded to a centred square, as written by `roi.extract`. Its box: the
+contiguous frames around the peak of the z weights (>= z_rel x peak), their
+in-plane maps averaged; in-plane, the main connected component of the smallest
+region holding `mass` of the attention.
 
 Localised = compact: in-plane box area / slice area <= max_area and frames
 spanned / frames <= max_z_frac. Otherwise no box.
@@ -46,27 +40,20 @@ def _main_component(region, weights, structure):
     return lab == main, float(comp_mass[main - 1] / max(comp_mass.sum(), 1e-12))
 
 
-def grid_box(xy, z, mode="cc3d", mass=0.5, z_rel=0.5):
-    """-> dict(f0, f1, gy0, gy1, gx0, gx1, purity) on the frame / grid axes."""
-    if mode == "zrun":
-        peak = int(np.argmax(z))
-        keep = z >= z_rel * z[peak]
-        lo = hi = peak
-        while lo > 0 and keep[lo - 1]:
-            lo -= 1
-        while hi < len(z) - 1 and keep[hi + 1]:
-            hi += 1
-        w = z[lo:hi + 1] / z[lo:hi + 1].sum()
-        avg = np.tensordot(w, xy[lo:hi + 1].astype(np.float32), axes=1)
-        comp, purity = _main_component(smallest_mass_set(avg, mass), avg, np.ones((3, 3)))
-        ys, xs = np.nonzero(comp)
-        return dict(f0=lo, f1=hi, gy0=ys.min(), gy1=ys.max(), gx0=xs.min(), gx1=xs.max(),
-                    purity=purity)
-    vol = xy.astype(np.float32) * z[:, None, None]
-    comp, purity = _main_component(smallest_mass_set(vol, mass), vol, np.ones((3, 3, 3)))
-    fs, ys, xs = np.nonzero(comp)
-    return dict(f0=fs.min(), f1=fs.max(), gy0=ys.min(), gy1=ys.max(), gx0=xs.min(), gx1=xs.max(),
-                purity=purity)
+def grid_box(xy, z, mass=0.5, z_rel=0.5):
+    """(F, G, G) in-plane maps + (F,) z weights -> dict(f0, f1, gy0, gy1, gx0, gx1, purity) on the frame / grid axes."""
+    peak = int(np.argmax(z))
+    keep = z >= z_rel * z[peak]
+    lo = hi = peak
+    while lo > 0 and keep[lo - 1]:
+        lo -= 1
+    while hi < len(z) - 1 and keep[hi + 1]:
+        hi += 1
+    w = z[lo:hi + 1] / z[lo:hi + 1].sum()
+    avg = np.tensordot(w, xy[lo:hi + 1].astype(np.float32), axes=1)
+    comp, purity = _main_component(smallest_mass_set(avg, mass), avg, np.ones((3, 3)))
+    ys, xs = np.nonzero(comp)
+    return dict(f0=lo, f1=hi, gy0=ys.min(), gy1=ys.max(), gx0=xs.min(), gx1=xs.max(), purity=purity)
 
 
 def to_voxels(b, slices, rows, cols, grid):

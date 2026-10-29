@@ -178,7 +178,7 @@ def fit(model, train_loader, val_loader, index, args, ctx, sampler=None):
             image = batch["image"].to(device, non_blocking=True).float() / 255
             target = batch["target"].to(device, non_blocking=True).float()
             labelled = batch["labelled"].to(device, non_blocking=True)
-            image, target = gpu_augment(image, target, batch["sagittal"], args.augmentations)
+            image, target = gpu_augment(image, target, args.augmentations)
             with torch.autocast(device.type, dtype=torch.bfloat16):
                 logits = model(image)
             loss = masked_loss(logits.float(), target, labelled)

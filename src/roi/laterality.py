@@ -1,42 +1,28 @@
-"""Medial / lateral sanity check of ROI boxes, from the knee's side.
-
-    python -m roi.laterality round0 round1 round0_pred
+"""Medial / lateral sanity checks of ROI boxes, from the knee's side (`roi.evaluate` reports them).
 
 Cross-view agreement cannot catch a medial / lateral swap made the same way in
 both views. Laterality can: in patient coordinates (DICOM LPS, +x towards the
 patient's left) the medial side of a right knee faces +x, that of a left knee -x.
 So in a series with both boxes, the medial one must lie on the correct side of
-the lateral one. About half the studies carry a Laterality tag (R / L); the
-check runs on those.
+the lateral one. The side of each series is the side classifier's (`side_cls.py`).
 
 Per pair (menisci, tibiofemoral OA compartments): the share of series where the
 medial box is on the medial side. 0.5 would be a coin flip. Also reported: the
 share of series whose meniscus box lies in its own compartment's box
-(`pair_consistency`).
-
-    python -m roi.laterality --save_side round1_pred   # writes output/roi/knee_side.csv
+(`pair_consistency`). The label merges (`roi.labels merge`) drop the boxes that
+fail either check.
 """
 
 import functools
 import os
-import sys
 
 import numpy as np
 import pandas as pd
 
 from params import OUTPUT_FOLDER
 from roi.boxes import world_box
-from roi.labels import LABEL_DIR
 
 PAIRS = [("Medial Meniscus", "Lateral Meniscus"), ("Medial OA", "Lateral OA")]
-
-
-@functools.lru_cache(maxsize=None)
-def knee_side():
-    m = pd.read_csv(os.path.join(OUTPUT_FOLDER, "metadata.csv"), usecols=["StudyInstanceUID", "Laterality"])
-    side = m.dropna().assign(Laterality=lambda d: d.Laterality.str.upper().str[0])
-    side = side[side.Laterality.isin(["R", "L"])].groupby("StudyInstanceUID").Laterality.agg(set)
-    return side[side.map(len) == 1].map(lambda s: next(iter(s)))
 
 
 @functools.lru_cache(maxsize=None)
@@ -77,47 +63,6 @@ def check(boxes):
     return out
 
 
-def main(names):
-    if names[:1] == ["--save_side"]:
-        return save_side(names[1])
-    for name in names:
-        df = pd.read_csv(os.path.join(LABEL_DIR, f"{name}.csv"))
-        if "conf" in df:
-            df = df[df.conf >= 0.5]
-        res = check(df)
-        pc, _ = pair_consistency(df)
-        print(f"{name:14s} " + "   ".join(f"{k}: medial side correct {v:.3f} (n={n})" for k, (v, n) in res.items())
-              + "   |  meniscus inside its compartment: "
-              + "   ".join(f"{k} {v:.3f} (n={n})" for k, (v, n) in pc.items()))
-
-
-def infer_side(pred):
-    """Knee side per study: the DICOM tag where present, else from predicted OA boxes.
-
-    The tibiofemoral OA boxes put the medial compartment on the medial side ~98%
-    of the time (see `check`), so for an untagged study the side is the majority
-    vote over its series of where the medial OA box sits relative to the lateral.
-    """
-    side = knee_side().to_dict()
-    votes = {}
-    b = pred[pred["class"].isin(["Medial OA", "Lateral OA"]) & pred.z0.notna()]
-    if "conf" in b:
-        b = b[b.conf >= 0.5]
-    for uid, g in b.groupby("SeriesInstanceUID"):
-        study = g.StudyInstanceUID.iloc[0]
-        if study in side or set(g["class"]) != {"Medial OA", "Lateral OA"}:
-            continue
-        cx = {}
-        for _, r in g.iterrows():
-            lo, hi = world_box(uid, int(r.z0), int(r.z1), int(r.y0), int(r.y1), int(r.x0), int(r.x1))
-            cx[r["class"]] = (lo[0] + hi[0]) / 2
-        votes.setdefault(study, []).append(1 if cx["Medial OA"] > cx["Lateral OA"] else -1)
-    for study, v in votes.items():
-        if sum(v) != 0:
-            side[study] = "R" if sum(v) > 0 else "L"
-    return side
-
-
 def wrong_side(labels, side=None):
     """Boolean mask of the medial / lateral labels that sit on the wrong side.
 
@@ -145,19 +90,6 @@ def wrong_side(labels, side=None):
 
 
 
-SIDE_CSV = os.path.join(OUTPUT_FOLDER, "roi", "knee_side.csv")
-
-
-def save_side(pred_name):
-    """Knee side of every study (tag, else inferred from `pred_name`) to output/roi/knee_side.csv."""
-    pred = pd.read_csv(os.path.join(LABEL_DIR, f"{pred_name}.csv"))
-    side = infer_side(pred)
-    tags = knee_side()
-    df = pd.DataFrame({"StudyInstanceUID": list(side), "side": list(side.values())})
-    df["source"] = np.where(df.StudyInstanceUID.isin(tags.index), "dicom", "inferred")
-    df.to_csv(SIDE_CSV, index=False)
-    print(f"-> {SIDE_CSV}: {df.source.value_counts().to_dict()}")
-
 
 def pair_consistency(boxes):
     """Share of series whose meniscus box centre lies inside the same-side compartment box.
@@ -183,6 +115,3 @@ def pair_consistency(boxes):
         out[side] = (float(np.mean(ok)) if ok else np.nan, len(ok))
     return out, bad
 
-
-if __name__ == "__main__":
-    main(sys.argv[1:])
